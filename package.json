@@ -1,0 +1,22 @@
+{
+  "name": "project-observatory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only, evidence-backed project intelligence service.",
+  "scripts": {
+    "build": "node ./node_modules/typescript/bin/tsc -p tsconfig.json",
+    "check": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+    "test": "node ./node_modules/typescript/bin/tsc -p tsconfig.json && node --test dist/tests/acceptance.test.js",
+    "start": "node dist/index.js",
+    "dev": "node --watch --import tsx src/index.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.6",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  }
+}

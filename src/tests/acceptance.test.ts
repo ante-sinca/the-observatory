@@ -1,0 +1,156 @@
+import assert from "node:assert/strict";
+import type { AddressInfo } from "node:net";
+import test from "node:test";
+import type { ArtifactContent, DeploymentAdapter, DeploymentRecord, HealthResult, SourceAdapter, SourceArtifactRef, SourceConfig, SourceRevision } from "../domain/types.js";
+import { ConfigCipher, isAllowedArtifact } from "../core/security.js";
+import { MemoryStore } from "../core/store.js";
+import { ObservatoryToolService } from "../mcp/tools.js";
+import { createHttpServer } from "../http/server.js";
+import { ProjectRegistry } from "../services/project-registry.js";
+import { ProjectQueryService } from "../services/query.js";
+import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
+
+class RepositoryFixture implements SourceAdapter {
+  readonly kind = "fixture";
+  revision = "r1";
+  files = new Map<string, string>();
+  async healthCheck(): Promise<HealthResult> { return { state: "healthy", checkedAt: "2026-09-23T00:00:00.000Z" }; }
+  async getRevision(): Promise<SourceRevision> { return { value: this.revision, observedAt: "2026-09-23T00:00:00.000Z" }; }
+  async listArtifacts(): Promise<SourceArtifactRef[]> { return [...this.files].map(([path, content]) => ({ externalId: `${this.revision}:${path}`, path, artifactType: "text", size: Buffer.byteLength(content) })); }
+  async readArtifact(_config: SourceConfig, artifact: SourceArtifactRef): Promise<ArtifactContent> { const content = this.files.get(artifact.path); if (content === undefined) throw new Error("missing fixture content"); return { content, encoding: "utf8" }; }
+}
+
+class FailingDeploymentFixture implements DeploymentAdapter {
+  readonly kind = "failing-deployment";
+  async healthCheck(): Promise<HealthResult> { return { state: "healthy", checkedAt: "2026-09-23T00:00:00.000Z" }; }
+  async getCurrentDeployment(): Promise<DeploymentRecord | null> { throw new Error("deployment API unavailable"); }
+  async listRecentDeployments(): Promise<DeploymentRecord[]> { return []; }
+}
+
+function setup() {
+  const store = new MemoryStore();
+  const registry = new ProjectRegistry(store, ConfigCipher.fromEnvironment(), () => new Date("2026-09-23T00:00:00.000Z"));
+  const repository = new RepositoryFixture();
+  const adapters = new AdapterRegistry().registerRepository(repository).registerDeployment(new FailingDeploymentFixture());
+  const refresh = new RefreshOrchestrator(store, adapters, () => new Date("2026-09-23T00:00:00.000Z"));
+  const queries = new ProjectQueryService(store);
+  return { store, registry, repository, refresh, queries, tools: new ObservatoryToolService(queries) };
+}
+
+test("a second project uses the same project-agnostic core", async () => {
+  const { registry, refresh, queries, repository } = setup();
+  repository.files.set("README.md", "# Shared project\nA document.");
+  const first = registry.createProject({ slug: "alpha", name: "Alpha" });
+  const second = registry.createProject({ slug: "beta", name: "Beta" });
+  registry.addSource(first.id, { type: "repository", provider: "fixture", config: { include: ["README.md"] } });
+  registry.addSource(second.id, { type: "repository", provider: "fixture", config: { include: ["README.md"] } });
+  await refresh.refresh(first.id);
+  await refresh.refresh(second.id);
+  assert.equal(queries.listProjects().length, 2);
+  assert.equal(queries.searchProject(second.id, "shared").length, 1);
+});
+
+test("an unchanged refresh is idempotent and produces no movement noise", async () => {
+  const { store, registry, refresh, repository } = setup();
+  repository.files.set("README.md", "# Current state\nObserved evidence.");
+  const project = registry.createProject({ slug: "one", name: "One" });
+  registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  const first = await refresh.refresh(project.id);
+  const second = await refresh.refresh(project.id);
+  assert.ok(first.snapshot);
+  assert.equal(second.idempotent, true);
+  assert.equal(store.snapshots.length, 1);
+  assert.equal(store.movements.length, 1);
+});
+
+test("secret-pattern files can never be ingested", async () => {
+  const { store, registry, refresh, repository } = setup();
+  repository.files.set("README.md", "# Safe\nNormal knowledge.");
+  repository.files.set(".env.production", "TOKEN=should-not-index");
+  repository.files.set("credentials/service.json", "not safe");
+  const project = registry.createProject({ slug: "safe", name: "Safe" });
+  registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  await refresh.refresh(project.id);
+  assert.deepEqual(store.artifacts.map((artifact) => artifact.path), ["README.md"]);
+  assert.equal(isAllowedArtifact(".env"), false);
+  assert.equal(isAllowedArtifact("credentials/token.json"), false);
+});
+
+test("search results retain file and revision provenance", async () => {
+  const { registry, refresh, repository, queries } = setup();
+  repository.files.set("docs/decision.md", "# Rate policy\nA fixed daily rate is documented.");
+  const project = registry.createProject({ slug: "proof", name: "Proof" });
+  registry.addSource(project.id, { type: "repository", provider: "fixture", config: { include: ["docs/**"] } });
+  await refresh.refresh(project.id);
+  const [result] = queries.searchProject(project.id, "fixed daily");
+  assert.equal(result?.provenance[0]?.path, "docs/decision.md");
+  assert.equal(result?.provenance[0]?.repositoryCommit, "r1");
+});
+
+test("a deployment failure does not block repository ingestion", async () => {
+  const { registry, refresh, repository, queries } = setup();
+  repository.files.set("README.md", "# Repository evidence\nStill refresh this.");
+  const project = registry.createProject({ slug: "partial", name: "Partial" });
+  registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  registry.addSource(project.id, { type: "deployment", provider: "failing-deployment", config: {} });
+  const result = await refresh.refresh(project.id);
+  assert.equal(result.run.status, "partial");
+  assert.equal(queries.searchProject(project.id, "repository").length, 1);
+  assert.ok(queries.getConflicts(project.id).some((conflict) => conflict.type === "source_unavailable"));
+});
+
+test("changed evidence produces immutable snapshots and a changed movement", async () => {
+  const { store, registry, refresh, repository, queries } = setup();
+  repository.files.set("README.md", "# Policy\nInitial policy.");
+  const project = registry.createProject({ slug: "changes", name: "Changes" });
+  registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  const first = await refresh.refresh(project.id);
+  repository.revision = "r2";
+  repository.files.set("README.md", "# Policy\nUpdated policy.");
+  const second = await refresh.refresh(project.id);
+  assert.ok(first.snapshot && second.snapshot);
+  assert.equal(store.snapshots.length, 2);
+  assert.ok(queries.compareSnapshots(project.id, first.snapshot!.id, second.snapshot!.id).some((movement) => movement.movementType === "changed"));
+  assert.equal(first.snapshot!.knowledgeItemIds.length, 1);
+});
+
+test("explicit contradictory documentation and implementation evidence creates a conflict", async () => {
+  const { registry, refresh, repository, queries } = setup();
+  repository.files.set("docs/flow.md", "# Flow\n<!-- observatory:assert historical-replay = disabled -->");
+  repository.files.set("lib/flow.ts", "// observatory:assert historical-replay = enabled");
+  const project = registry.createProject({ slug: "conflicts", name: "Conflicts" });
+  registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  await refresh.refresh(project.id);
+  const conflict = queries.getConflicts(project.id).find((item) => item.type === "evidence_mismatch");
+  assert.ok(conflict);
+  assert.equal(conflict?.evidence.key, "historical-replay");
+});
+
+test("MCP registry contains only documented read-only tools and delegates queries", async () => {
+  const { registry, refresh, repository, tools } = setup();
+  repository.files.set("README.md", "# Read only\nEvidence.");
+  const project = registry.createProject({ slug: "tools", name: "Tools" });
+  registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  await refresh.refresh(project.id);
+  const names = tools.listTools().map((tool) => tool.name);
+  assert.deepEqual(names, ["list_projects", "get_project_state", "search_project", "get_recent_changes", "get_deployments", "get_decisions", "get_known_risks", "get_knowledge_item", "compare_snapshots", "get_source_artifact"]);
+  assert.equal((tools.call("search_project", { project: project.id, query: "evidence" }) as unknown[]).length, 1);
+  assert.equal(names.some((name) => ["edit_file", "commit", "merge", "deploy", "execute_sql", "send_payment", "mutate_production"].includes(name)), false);
+});
+
+test("HTTP project administration and read-only MCP discovery use the shared services", async () => {
+  const { registry, refresh, queries, tools } = setup();
+  const server = createHttpServer({ registry, refresh, queries, tools });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const created = await fetch(`http://127.0.0.1:${port}/api/projects`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ slug: "http-project", name: "HTTP Project" }) });
+    assert.equal(created.status, 201);
+    const projects = await (await fetch(`http://127.0.0.1:${port}/api/projects`)).json() as Array<{ slug: string }>;
+    assert.deepEqual(projects.map((project) => project.slug), ["http-project"]);
+    const toolCatalog = await (await fetch(`http://127.0.0.1:${port}/mcp/tools`)).json() as { tools: Array<{ name: string }> };
+    assert.ok(toolCatalog.tools.some((tool) => tool.name === "get_project_state"));
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
