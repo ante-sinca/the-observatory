@@ -14,7 +14,7 @@ import type {
   SourceArtifact,
 } from "../domain/types.js";
 import { ConfigCipher } from "./security.js";
-import { databaseUrlFromEnvironment, MemoryStore } from "./store.js";
+import { databaseUrlFromEnvironment, MemoryStore, verifiedPostgresUrl } from "./store.js";
 
 type Row = Record<string, unknown>;
 
@@ -51,7 +51,7 @@ export class PostgresStore extends MemoryStore {
   constructor(private readonly cipher: ConfigCipher, connectionString = databaseUrlFromEnvironment()) {
     super();
     if (!connectionString) throw new Error("A provider-managed PostgreSQL connection is required (DATABASE_URL).");
-    this.pool = new Pool({ connectionString, max: 4 });
+    this.pool = new Pool({ connectionString: verifiedPostgresUrl(connectionString), max: 4 });
     if (process.env.VERCEL === "1") attachDatabasePool(this.pool);
     this.loaded = this.load();
   }

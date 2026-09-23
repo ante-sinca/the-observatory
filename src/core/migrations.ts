@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
-import { migrationDatabaseUrlFromEnvironment } from "./store.js";
+import { migrationDatabaseUrlFromEnvironment, verifiedPostgresUrl } from "./store.js";
 
 export interface MigrationReport {
   database: string;
@@ -23,7 +23,7 @@ export async function runMigrations(options: { connectionString?: string; migrat
   if (!connectionString) throw new Error("A provider-managed PostgreSQL connection is required (POSTGRES_URL_NON_POOLING or POSTGRES_URL).");
   const migrationDirectory = options.migrationDirectory ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../migrations");
   const migrations = await readMigrations(migrationDirectory);
-  const pool = new Pool({ connectionString, max: 1 });
+  const pool = new Pool({ connectionString: verifiedPostgresUrl(connectionString), max: 1 });
   const client = await pool.connect();
   try {
     await client.query("CREATE TABLE IF NOT EXISTS observatory_schema_migrations (version TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())");

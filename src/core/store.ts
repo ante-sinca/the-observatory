@@ -25,6 +25,17 @@ export function migrationDatabaseUrlFromEnvironment(environment: NodeJS.ProcessE
 }
 
 /**
+ * Newer pg releases require the secure meaning of a provider's legacy
+ * `sslmode=require` to be stated explicitly. Keep the connection encrypted
+ * and certificate-verified without logging or otherwise exposing its value.
+ */
+export function verifiedPostgresUrl(connectionString: string): string {
+  const parsed = new URL(connectionString);
+  if (parsed.searchParams.get("sslmode") === "require") parsed.searchParams.set("sslmode", "verify-full");
+  return parsed.toString();
+}
+
+/**
  * The application relies on this repository boundary, not a vendor API.  The
  * in-memory implementation makes refresh deterministic and fully testable;
  * the supplied SQL migration is the production PostgreSQL schema.

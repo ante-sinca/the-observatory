@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 import { ConfigCipher } from "../core/security.js";
 import { PostgresStore } from "../core/postgres-store.js";
-import { databaseUrlFromEnvironment } from "../core/store.js";
+import { databaseUrlFromEnvironment, verifiedPostgresUrl } from "../core/store.js";
 import { createHttpServer } from "../http/server.js";
 import { ObservatoryToolService } from "../mcp/tools.js";
 import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
@@ -36,6 +36,7 @@ const cipher = new ConfigCipher(Buffer.alloc(32, 7));
 
 test("missing PostgreSQL configuration is rejected before production startup", async () => {
   assert.equal(databaseUrlFromEnvironment({}), undefined);
+  assert.match(verifiedPostgresUrl("postgresql://user:pass@host.example/db?sslmode=require"), /sslmode=verify-full/);
   const originalNodeEnv = process.env.NODE_ENV;
   const originalDatabaseUrl = process.env.DATABASE_URL;
   const originalConfigKey = process.env.OBSERVATORY_CONFIG_KEY;
