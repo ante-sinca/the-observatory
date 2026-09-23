@@ -47,16 +47,19 @@ export class PostgresStore extends MemoryStore {
   readonly persistent = true;
   private readonly pool: Pool;
   private readonly loaded: Promise<void>;
+  private persistenceChain: Promise<void> = Promise.resolve();
 
   constructor(private readonly cipher: ConfigCipher, connectionString = databaseUrlFromEnvironment()) {
     super();
     if (!connectionString) throw new Error("A provider-managed PostgreSQL connection is required (DATABASE_URL).");
     this.pool = new Pool({ connectionString: verifiedPostgresUrl(connectionString), max: 4 });
     if (process.env.VERCEL === "1") attachDatabasePool(this.pool);
-    this.loaded = this.load();
+    this.loaded = this.enqueue(() => this.load());
   }
 
   async ready(): Promise<void> { await this.loaded; }
+
+  async reload(): Promise<void> { await this.enqueue(() => this.load()); }
 
   async close(): Promise<void> { await this.pool.end(); }
 
@@ -102,8 +105,15 @@ export class PostgresStore extends MemoryStore {
     }
   }
 
-  async flush(): Promise<void> {
-    await this.ready();
+  async flush(): Promise<void> { await this.enqueue(() => this.persist()); }
+
+  private enqueue(operation: () => Promise<void>): Promise<void> {
+    const next = this.persistenceChain.then(operation, operation);
+    this.persistenceChain = next.catch(() => undefined);
+    return next;
+  }
+
+  private async persist(): Promise<void> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");

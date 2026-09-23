@@ -54,6 +54,8 @@ export interface ObservatoryStore {
   auditEvents: AuditEvent[];
   /** Wait until this store has loaded its durable state. MemoryStore is ready immediately. */
   ready(): Promise<void>;
+  /** Refresh the in-process read model from its durable canonical state. */
+  reload(): Promise<void>;
   /** Persist all state changed by the enclosing service operation. */
   flush(): Promise<void>;
 }
@@ -72,6 +74,7 @@ export class MemoryStore implements ObservatoryStore {
   auditEvents: AuditEvent[] = [];
 
   async ready(): Promise<void> { /* intentionally in-memory */ }
+  async reload(): Promise<void> { /* intentionally in-memory */ }
   async flush(): Promise<void> { /* intentionally in-memory */ }
 }
 

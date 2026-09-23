@@ -18,7 +18,12 @@ export function createVercelHandler(services: Promise<Observatory>) {
       const query = rewritten.searchParams.toString();
       request.url = `${originalPath.startsWith("/") ? originalPath : `/${originalPath}`}${query ? `?${query}` : ""}`;
     }
-    await handleHttpRequest(request, response, await services);
+    // A warm serverless instance may have served another invocation before a
+    // different instance committed data. Rehydrate before every request so
+    // response correctness never depends on sticky process memory.
+    const initialized = await services;
+    await initialized.store.reload();
+    await handleHttpRequest(request, response, initialized);
   } catch (error) {
     response.writeHead(500, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
     response.end(JSON.stringify({ error: error instanceof Error ? error.message : "Unable to initialize durable storage." }));
@@ -26,8 +31,8 @@ export function createVercelHandler(services: Promise<Observatory>) {
   };
 }
 
-// Vercel may reuse this promise between invocations, but correctness never
-// relies on that reuse: its first initialization hydrates state from Neon.
+// Vercel may reuse this promise between invocations. The handler still reloads
+// canonical Neon state before serving each request.
 export default function vercelHandler(request: IncomingMessage, response: ServerResponse): Promise<void> {
   observatory ??= createObservatory();
   return createVercelHandler(observatory)(request, response);

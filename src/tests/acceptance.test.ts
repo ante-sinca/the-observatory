@@ -161,8 +161,12 @@ test("HTTP project administration and read-only MCP discovery use the shared ser
 test("the Vercel adapter preserves the public route for the shared HTTP router", async () => {
   // The Vercel handler is intentionally a thin function, not a replacement
   // HTTP implementation. This uses Node's adapter shape to exercise its path
-  // restoration before the shared router handles /health.
-  const handler = createVercelHandler(createObservatory({ store: new MemoryStore() }));
+  // restoration and pre-request state reload before the shared router handles
+  // /health.
+  const store = new MemoryStore();
+  let reloads = 0;
+  store.reload = async () => { reloads += 1; };
+  const handler = createVercelHandler(createObservatory({ store }));
   const server = createServer(handler);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
@@ -170,6 +174,7 @@ test("the Vercel adapter preserves the public route for the shared HTTP router",
     const response = await fetch(`http://127.0.0.1:${port}/api?__observatory_path=/health`);
     assert.equal(response.status, 200);
     assert.equal((await response.json() as { status: string }).status, "ok");
+    assert.equal(reloads, 1);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
