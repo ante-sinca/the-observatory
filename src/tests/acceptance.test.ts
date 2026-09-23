@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 import type { ArtifactContent, DeploymentAdapter, DeploymentRecord, HealthResult, SourceAdapter, SourceArtifactRef, SourceConfig, SourceRevision } from "../domain/types.js";
@@ -6,6 +7,8 @@ import { ConfigCipher, isAllowedArtifact } from "../core/security.js";
 import { MemoryStore } from "../core/store.js";
 import { ObservatoryToolService } from "../mcp/tools.js";
 import { createHttpServer } from "../http/server.js";
+import { createVercelHandler } from "../http/vercel.js";
+import { createObservatory } from "../index.js";
 import { ProjectRegistry } from "../services/project-registry.js";
 import { ProjectQueryService } from "../services/query.js";
 import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
@@ -40,10 +43,10 @@ function setup() {
 test("a second project uses the same project-agnostic core", async () => {
   const { registry, refresh, queries, repository } = setup();
   repository.files.set("README.md", "# Shared project\nA document.");
-  const first = registry.createProject({ slug: "alpha", name: "Alpha" });
-  const second = registry.createProject({ slug: "beta", name: "Beta" });
-  registry.addSource(first.id, { type: "repository", provider: "fixture", config: { include: ["README.md"] } });
-  registry.addSource(second.id, { type: "repository", provider: "fixture", config: { include: ["README.md"] } });
+  const first = await registry.createProject({ slug: "alpha", name: "Alpha" });
+  const second = await registry.createProject({ slug: "beta", name: "Beta" });
+  await registry.addSource(first.id, { type: "repository", provider: "fixture", config: { include: ["README.md"] } });
+  await registry.addSource(second.id, { type: "repository", provider: "fixture", config: { include: ["README.md"] } });
   await refresh.refresh(first.id);
   await refresh.refresh(second.id);
   assert.equal(queries.listProjects().length, 2);
@@ -53,8 +56,8 @@ test("a second project uses the same project-agnostic core", async () => {
 test("an unchanged refresh is idempotent and produces no movement noise", async () => {
   const { store, registry, refresh, repository } = setup();
   repository.files.set("README.md", "# Current state\nObserved evidence.");
-  const project = registry.createProject({ slug: "one", name: "One" });
-  registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  const project = await registry.createProject({ slug: "one", name: "One" });
+  await registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
   const first = await refresh.refresh(project.id);
   const second = await refresh.refresh(project.id);
   assert.ok(first.snapshot);
@@ -68,8 +71,8 @@ test("secret-pattern files can never be ingested", async () => {
   repository.files.set("README.md", "# Safe\nNormal knowledge.");
   repository.files.set(".env.production", "TOKEN=should-not-index");
   repository.files.set("credentials/service.json", "not safe");
-  const project = registry.createProject({ slug: "safe", name: "Safe" });
-  registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  const project = await registry.createProject({ slug: "safe", name: "Safe" });
+  await registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
   await refresh.refresh(project.id);
   assert.deepEqual(store.artifacts.map((artifact) => artifact.path), ["README.md"]);
   assert.equal(isAllowedArtifact(".env"), false);
@@ -79,8 +82,8 @@ test("secret-pattern files can never be ingested", async () => {
 test("search results retain file and revision provenance", async () => {
   const { registry, refresh, repository, queries } = setup();
   repository.files.set("docs/decision.md", "# Rate policy\nA fixed daily rate is documented.");
-  const project = registry.createProject({ slug: "proof", name: "Proof" });
-  registry.addSource(project.id, { type: "repository", provider: "fixture", config: { include: ["docs/**"] } });
+  const project = await registry.createProject({ slug: "proof", name: "Proof" });
+  await registry.addSource(project.id, { type: "repository", provider: "fixture", config: { include: ["docs/**"] } });
   await refresh.refresh(project.id);
   const [result] = queries.searchProject(project.id, "fixed daily");
   assert.equal(result?.provenance[0]?.path, "docs/decision.md");
@@ -90,9 +93,9 @@ test("search results retain file and revision provenance", async () => {
 test("a deployment failure does not block repository ingestion", async () => {
   const { registry, refresh, repository, queries } = setup();
   repository.files.set("README.md", "# Repository evidence\nStill refresh this.");
-  const project = registry.createProject({ slug: "partial", name: "Partial" });
-  registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
-  registry.addSource(project.id, { type: "deployment", provider: "failing-deployment", config: {} });
+  const project = await registry.createProject({ slug: "partial", name: "Partial" });
+  await registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  await registry.addSource(project.id, { type: "deployment", provider: "failing-deployment", config: {} });
   const result = await refresh.refresh(project.id);
   assert.equal(result.run.status, "partial");
   assert.equal(queries.searchProject(project.id, "repository").length, 1);
@@ -102,8 +105,8 @@ test("a deployment failure does not block repository ingestion", async () => {
 test("changed evidence produces immutable snapshots and a changed movement", async () => {
   const { store, registry, refresh, repository, queries } = setup();
   repository.files.set("README.md", "# Policy\nInitial policy.");
-  const project = registry.createProject({ slug: "changes", name: "Changes" });
-  registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  const project = await registry.createProject({ slug: "changes", name: "Changes" });
+  await registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
   const first = await refresh.refresh(project.id);
   repository.revision = "r2";
   repository.files.set("README.md", "# Policy\nUpdated policy.");
@@ -118,8 +121,8 @@ test("explicit contradictory documentation and implementation evidence creates a
   const { registry, refresh, repository, queries } = setup();
   repository.files.set("docs/flow.md", "# Flow\n<!-- observatory:assert historical-replay = disabled -->");
   repository.files.set("lib/flow.ts", "// observatory:assert historical-replay = enabled");
-  const project = registry.createProject({ slug: "conflicts", name: "Conflicts" });
-  registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  const project = await registry.createProject({ slug: "conflicts", name: "Conflicts" });
+  await registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
   await refresh.refresh(project.id);
   const conflict = queries.getConflicts(project.id).find((item) => item.type === "evidence_mismatch");
   assert.ok(conflict);
@@ -129,8 +132,8 @@ test("explicit contradictory documentation and implementation evidence creates a
 test("MCP registry contains only documented read-only tools and delegates queries", async () => {
   const { registry, refresh, repository, tools } = setup();
   repository.files.set("README.md", "# Read only\nEvidence.");
-  const project = registry.createProject({ slug: "tools", name: "Tools" });
-  registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  const project = await registry.createProject({ slug: "tools", name: "Tools" });
+  await registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
   await refresh.refresh(project.id);
   const names = tools.listTools().map((tool) => tool.name);
   assert.deepEqual(names, ["list_projects", "get_project_state", "search_project", "get_recent_changes", "get_deployments", "get_decisions", "get_known_risks", "get_knowledge_item", "compare_snapshots", "get_source_artifact"]);
@@ -150,6 +153,23 @@ test("HTTP project administration and read-only MCP discovery use the shared ser
     assert.deepEqual(projects.map((project) => project.slug), ["http-project"]);
     const toolCatalog = await (await fetch(`http://127.0.0.1:${port}/mcp/tools`)).json() as { tools: Array<{ name: string }> };
     assert.ok(toolCatalog.tools.some((tool) => tool.name === "get_project_state"));
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("the Vercel adapter preserves the public route for the shared HTTP router", async () => {
+  // The Vercel handler is intentionally a thin function, not a replacement
+  // HTTP implementation. This uses Node's adapter shape to exercise its path
+  // restoration before the shared router handles /health.
+  const handler = createVercelHandler(createObservatory({ store: new MemoryStore() }));
+  const server = createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const port = (server.address() as AddressInfo).port;
+    const response = await fetch(`http://127.0.0.1:${port}/api?__observatory_path=/health`);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json() as { status: string }).status, "ok");
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }

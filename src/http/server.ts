@@ -3,7 +3,7 @@ import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
 import { ProjectRegistry } from "../services/project-registry.js";
 import { ProjectQueryService } from "../services/query.js";
 import { ObservatoryToolService } from "../mcp/tools.js";
-import type { SourceConfig, SourceType } from "../domain/types.js";
+import type { ProjectSource, SourceConfig, SourceType } from "../domain/types.js";
 
 export interface ObservatoryHttpServices {
   registry: ProjectRegistry;
@@ -14,14 +14,19 @@ export interface ObservatoryHttpServices {
 
 export function createHttpServer(services: ObservatoryHttpServices): Server {
   return createServer(async (request, response) => {
-    try {
-      await route(request, response, services);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unexpected server error.";
-      const status = /not found/i.test(message) ? 404 : /must|required|already exists|unsupported/i.test(message) ? 400 : 500;
-      send(response, status, { error: message });
-    }
+    await handleHttpRequest(request, response, services);
   });
+}
+
+/** Usable from Node's long-lived server and Vercel's one-invocation handler. */
+export async function handleHttpRequest(request: IncomingMessage, response: ServerResponse, services: ObservatoryHttpServices): Promise<void> {
+  try {
+    await route(request, response, services);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unexpected server error.";
+    const status = /not found/i.test(message) ? 404 : /must|required|already exists|unsupported/i.test(message) ? 400 : 500;
+    send(response, status, { error: message });
+  }
 }
 
 async function route(request: IncomingMessage, response: ServerResponse, services: ObservatoryHttpServices): Promise<void> {
@@ -46,7 +51,7 @@ async function route(request: IncomingMessage, response: ServerResponse, service
   if (path === "/api/projects" && method === "POST") {
     assertOperator(request);
     const body = await jsonBody(request);
-    return send(response, 201, services.registry.createProject({ slug: stringField(body, "slug"), name: stringField(body, "name"), description: optionalStringField(body, "description") }, actor(request)));
+    return send(response, 201, await services.registry.createProject({ slug: stringField(body, "slug"), name: stringField(body, "name"), description: optionalStringField(body, "description") }, actor(request)));
   }
   const segments = path.split("/").filter(Boolean).map(decodeURIComponent);
   if (segments[0] !== "api" || segments[1] !== "projects" || !segments[2]) return send(response, 404, { error: "Route not found." });
@@ -55,7 +60,7 @@ async function route(request: IncomingMessage, response: ServerResponse, service
   if (segments.length === 3 && method === "PATCH") {
     assertOperator(request);
     const body = await jsonBody(request);
-    return send(response, 200, services.registry.updateProject(services.queries.getProject(projectRef).id, { name: optionalStringField(body, "name"), description: optionalStringField(body, "description") }, actor(request)));
+    return send(response, 200, await services.registry.updateProject(services.queries.getProject(projectRef).id, { name: optionalStringField(body, "name"), description: optionalStringField(body, "description") }, actor(request)));
   }
   const projectId = services.queries.getProject(projectRef).id;
   const resource = segments[3];
@@ -65,7 +70,7 @@ async function route(request: IncomingMessage, response: ServerResponse, service
     const body = await jsonBody(request);
     const type = stringField(body, "type");
     if (type !== "repository" && type !== "deployment") throw new Error("'type' must be repository or deployment.");
-    return send(response, 201, publicSource(services.registry.addSource(projectId, { type: type as SourceType, provider: stringField(body, "provider"), config: recordField(body, "config") as SourceConfig, enabled: optionalBooleanField(body, "enabled") }, actor(request))));
+    return send(response, 201, publicSource(await services.registry.addSource(projectId, { type: type as SourceType, provider: stringField(body, "provider"), config: recordField(body, "config") as SourceConfig, enabled: optionalBooleanField(body, "enabled") }, actor(request))));
   }
   if (resource === "sources" && segments[4] && segments[5] === "health" && method === "POST") {
     assertOperator(request);
@@ -95,7 +100,7 @@ function assertOperator(request: IncomingMessage): void {
 }
 
 function actor(request: IncomingMessage): string | undefined { return typeof request.headers["x-observatory-actor"] === "string" ? request.headers["x-observatory-actor"] : undefined; }
-function publicSource(source: ReturnType<ProjectRegistry["addSource"]>) { return { id: source.id, projectId: source.projectId, type: source.type, provider: source.provider, enabled: source.enabled, lastHealth: source.lastHealth, lastCheckedAt: source.lastCheckedAt }; }
+function publicSource(source: ProjectSource) { return { id: source.id, projectId: source.projectId, type: source.type, provider: source.provider, enabled: source.enabled, lastHealth: source.lastHealth, lastCheckedAt: source.lastCheckedAt }; }
 function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 function stringField(value: Record<string, unknown>, key: string): string { const field = value[key]; if (typeof field !== "string" || !field.trim()) throw new Error(`'${key}' must be a non-empty string.`); return field; }
 function optionalStringField(value: Record<string, unknown>, key: string): string | undefined { const field = value[key]; if (field === undefined) return undefined; if (typeof field !== "string") throw new Error(`'${key}' must be a string.`); return field; }

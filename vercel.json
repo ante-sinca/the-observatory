@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/:path*", "destination": "/api?__observatory_path=/:path*" }
+  ]
+}

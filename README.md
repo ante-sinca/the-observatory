@@ -2,7 +2,7 @@
 
 ## Implementation
 
-This directory now contains a runnable TypeScript implementation alongside the
+This directory contains a runnable TypeScript implementation alongside the
 v0.1 contract documents. It is an external, evidence-backed, read-only
 observer: it never writes to an observed repository, deployment provider,
 database, or financial system.
@@ -15,15 +15,19 @@ read-only evidence → resolved knowledge with provenance → immutable snapshot
 
 ### Run locally
 
-Requires Node 20+ and a 32-byte base64 `OBSERVATORY_CONFIG_KEY` for production.
-Development uses a deliberately non-production fallback encryption key. The
-operator token is required for administrative HTTP calls in production.
+Requires Node 20+, the provider-managed Neon `POSTGRES_URL`, and a 32-byte
+base64 `OBSERVATORY_CONFIG_KEY` for production. Production fails closed if any
+of those required values is unavailable. Development uses a deliberately
+non-production fallback encryption key and an in-memory store only when no
+database URL is supplied. The operator token is required for administrative
+HTTP calls in production.
 
 ```powershell
 npm install
 npm run check
 npm test
 npm run build
+npm run migrate # guarded in production by OBSERVATORY_MIGRATE_PRODUCTION=true
 $env:PORT = 3000
 node dist/index.js
 ```
@@ -35,45 +39,26 @@ health probe. Start the same state service as an MCP stdio process with:
 node dist/index.js --mcp
 ```
 
-### Register HomeBound manually
+### Durable runtime and Vercel
 
-1. Create a GitHub fine-grained token restricted to the HomeBound repository
-   with **Contents: read-only** and **Metadata: read-only**. Do not grant any
-   write, deployment, workflow, database, or financial scope.
-2. Register the project (replace the placeholder token and repository):
+`POSTGRES_URL` is the provider-managed pooled Vercel/Neon runtime variable.
+`POSTGRES_URL_NON_POOLING` is reserved for the guarded migration runner. Source configurations are encrypted before they are persisted; they
+are decrypted only while building the registered read-only adapter. The
+PostgreSQL store hydrates all canonical state at process start, and both HTTP
+and HTTP MCP use the same services over that store. `api/index.ts` is a thin
+Vercel function adapter; the stdio MCP process remains a local/server runtime.
 
-```powershell
-$body = @{
-  slug = "homebound"; name = "HomeBound";
-  description = "External read-only project intelligence" 
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post -ContentType "application/json" -Body $body http://localhost:3000/api/projects
-```
+Migrations are ordered, checksummed, transactionally ledgered in
+`observatory_schema_migrations`, and never reset or drop data automatically.
+Run them only after verifying that `POSTGRES_URL_NON_POOLING` targets Observatory's
+dedicated Neon database. In production the explicit migration guard is
+required.
 
-3. Add a repository source using the returned project ID. The token is accepted
-   only as encrypted source configuration and is never returned by the API.
+### HomeBound is deliberately not registered
 
-```powershell
-$source = @{
-  type = "repository"; provider = "github";
-  config = @{
-    repository = "OWNER/HOMEBOUND"; token = "READ_ONLY_TOKEN"; defaultBranch = "main"; readOnly = $true;
-    include = @("README.md", "AGENTS.md", "docs/**", "package.json", "lib/**", "app/**", "tests/**");
-    exclude = @(".env*", "secrets/**", "credentials/**", "node_modules/**", ".next/**", "build/**", "coverage/**")
-  }
-} | ConvertTo-Json -Depth 5
-Invoke-RestMethod -Method Post -ContentType "application/json" -Body $source http://localhost:3000/api/projects/PROJECT_ID/sources
-```
-
-4. Optionally add a Vercel deployment source with a read-only token and its
-   Vercel project ID. Then trigger `POST /api/projects/PROJECT_ID/refresh`.
-   The state, provenance-backed knowledge, movements, conflicts, and snapshots
-   become available via `/api/projects/PROJECT_ID/*` and the read-only MCP tools.
-
-`migrations/001_initial.sql` is the PostgreSQL production schema. The supplied
-runtime uses a testable in-memory store; connect a transactional PostgreSQL
-store before a durable production deployment. That limitation is intentional
-and is not represented as a passed production release gate.
+No HomeBound repository, provider token, or deployment is configured by this
+project. Registration remains blocked until the dedicated Neon database and
+Vercel deployment pass the persistence release gate.
 
 Project Observatory is an external, read-only project intelligence service. It connects to software projects without requiring Observatory-specific code inside those repositories, builds a normalized knowledge/state model, tracks changes, and exposes project state to humans and AI clients.
 

@@ -128,6 +128,7 @@ export class RefreshOrchestrator {
     run.status = run.errors.length === 0 ? "success" : sourceSuccess.size > 0 ? "partial" : "failed";
     run.completedAt = this.clock().toISOString();
     this.store.auditEvents.push({ id: randomUUID(), projectId, action: "refresh.completed", metadata: { runId: run.id, status: run.status, idempotent: unchanged }, createdAt: run.completedAt });
+    await this.store.flush();
     return { run, snapshot, idempotent: unchanged };
   }
 
@@ -140,6 +141,7 @@ export class RefreshOrchestrator {
     source.lastHealth = health;
     source.lastCheckedAt = health.checkedAt;
     this.store.auditEvents.push({ id: randomUUID(), projectId, action: "source.health_checked", metadata: { sourceId, state: health.state }, createdAt: health.checkedAt });
+    await this.store.flush();
     return health;
   }
 
@@ -291,8 +293,8 @@ export class RefreshOrchestrator {
 
   private createConflicts(projectId: string, snapshot: Snapshot): void {
     const existingOpen = this.store.conflicts.filter((conflict) => conflict.projectId === projectId && conflict.status === "open");
-    for (const conflict of existingOpen) conflict.status = "resolved";
     const conflict = (type: Conflict["type"], severity: Conflict["severity"], title: string, description: string, evidence: Record<string, unknown>): void => {
+      if (existingOpen.some((item) => item.type === type && item.title === title && stable(item.evidence) === stable(evidence))) return;
       this.store.conflicts.push({ id: randomUUID(), projectId, snapshotId: snapshot.id, type, severity, title, description, evidence, status: "open" });
     };
     if (snapshot.repositoryRevision && snapshot.deploymentRevision && snapshot.repositoryRevision !== snapshot.deploymentRevision) {

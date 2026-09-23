@@ -7,7 +7,8 @@
   "scripts": {
     "build": "node ./node_modules/typescript/bin/tsc -p tsconfig.json",
     "check": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
-    "test": "node ./node_modules/typescript/bin/tsc -p tsconfig.json && node --test dist/tests/acceptance.test.js",
+    "test": "node ./node_modules/typescript/bin/tsc -p tsconfig.json && node --test dist/tests/acceptance.test.js dist/tests/postgres.acceptance.test.js",
+    "migrate": "node ./node_modules/typescript/bin/tsc -p tsconfig.json && node dist/core/migrations.js",
     "start": "node dist/index.js",
     "dev": "node --watch --import tsx src/index.ts"
   },
@@ -18,5 +19,10 @@
     "@types/node": "^24.13.6",
     "tsx": "^4.20.0",
     "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "@types/pg": "^8.23.1",
+    "@vercel/functions": "^3.9.9",
+    "pg": "^8.23.0"
   }
 }
