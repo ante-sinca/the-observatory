@@ -120,7 +120,10 @@ export class PostgresStore extends MemoryStore {
       for (const item of this.projects) await upsertProject(client, item);
       for (const item of this.sources) await upsertSource(client, item);
       for (const item of this.refreshRuns) await upsertRefreshRun(client, item);
-      for (const item of this.artifacts) await upsertArtifact(client, item);
+      for (const item of this.artifacts) {
+        const persistedId = await upsertArtifact(client, item);
+        if (persistedId !== item.id) this.rekeyArtifactReferences(item.id, persistedId, item);
+      }
       for (const item of this.knowledge) await upsertKnowledge(client, item);
       for (const item of this.provenance) await upsertProvenance(client, item);
       for (const item of this.deployments) await upsertDeployment(client, item);
@@ -136,6 +139,18 @@ export class PostgresStore extends MemoryStore {
       client.release();
     }
   }
+
+  /**
+   * The database owns the canonical id when two runtimes race to persist the
+   * same natural artifact identity. Keep newly created provenance pointing at
+   * that canonical row before it is written in this transaction.
+   */
+  private rekeyArtifactReferences(previousId: string, persistedId: string, artifact: SourceArtifact): void {
+    artifact.id = persistedId;
+    for (const provenance of this.provenance) {
+      if (provenance.sourceArtifactId === previousId) provenance.sourceArtifactId = persistedId;
+    }
+  }
 }
 
 function optionalString(value: unknown): string | undefined { return value === null || value === undefined ? undefined : String(value); }
@@ -144,7 +159,13 @@ function optionalNumber(value: unknown): number | undefined { return value === n
 async function upsertProject(client: PoolClient, item: Project): Promise<void> { await client.query("INSERT INTO projects (id,slug,name,description,status,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO UPDATE SET slug=EXCLUDED.slug,name=EXCLUDED.name,description=EXCLUDED.description,status=EXCLUDED.status,updated_at=EXCLUDED.updated_at", [item.id, item.slug, item.name, item.description ?? null, item.status, item.createdAt, item.updatedAt]); }
 async function upsertSource(client: PoolClient, item: ProjectSource): Promise<void> { await client.query("INSERT INTO project_sources (id,project_id,type,provider,config_json_encrypted,enabled,last_health_status,last_checked_at) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8) ON CONFLICT (id) DO UPDATE SET provider=EXCLUDED.provider,config_json_encrypted=EXCLUDED.config_json_encrypted,enabled=EXCLUDED.enabled,last_health_status=EXCLUDED.last_health_status,last_checked_at=EXCLUDED.last_checked_at", [item.id, item.projectId, item.type, item.provider, item.encryptedConfig, item.enabled, nullableParameterJson(item.lastHealth), item.lastCheckedAt ?? null]); }
 async function upsertRefreshRun(client: PoolClient, item: RefreshRun): Promise<void> { await client.query("INSERT INTO refresh_runs (id,project_id,started_at,completed_at,status,source_revision_json,errors_json) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb) ON CONFLICT (id) DO UPDATE SET completed_at=EXCLUDED.completed_at,status=EXCLUDED.status,source_revision_json=EXCLUDED.source_revision_json,errors_json=EXCLUDED.errors_json", [item.id, item.projectId, item.startedAt, item.completedAt ?? null, item.status, parameterJson(item.sourceRevisions), JSON.stringify(item.errors)]); }
-async function upsertArtifact(client: PoolClient, item: SourceArtifact): Promise<void> { await client.query("INSERT INTO source_artifacts (id,project_id,source_id,external_id,path,artifact_type,revision,content_hash,content_text,metadata_json,first_seen_at,last_seen_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12) ON CONFLICT (id) DO UPDATE SET last_seen_at=EXCLUDED.last_seen_at,content_text=EXCLUDED.content_text,metadata_json=EXCLUDED.metadata_json", [item.id, item.projectId, item.sourceId, item.externalId, item.path, item.artifactType, item.revision, item.contentHash, item.content ?? null, parameterJson(item.metadata), item.firstSeenAt, item.lastSeenAt]); }
+async function upsertArtifact(client: PoolClient, item: SourceArtifact): Promise<string> {
+  const result = await client.query<{ id: string }>(
+    "INSERT INTO source_artifacts (id,project_id,source_id,external_id,path,artifact_type,revision,content_hash,content_text,metadata_json,first_seen_at,last_seen_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12) ON CONFLICT (source_id,external_id,path,revision,content_hash) DO UPDATE SET last_seen_at=GREATEST(source_artifacts.last_seen_at,EXCLUDED.last_seen_at) RETURNING id",
+    [item.id, item.projectId, item.sourceId, item.externalId, item.path, item.artifactType, item.revision, item.contentHash, item.content ?? null, parameterJson(item.metadata), item.firstSeenAt, item.lastSeenAt],
+  );
+  return result.rows[0]?.id ?? item.id;
+}
 async function upsertKnowledge(client: PoolClient, item: KnowledgeItem): Promise<void> { await client.query("INSERT INTO knowledge_items (id,project_id,type,domain,title,body,status,documented_state,implemented_state,tested_state,deployed_state,observed_state,fingerprint,entity_key,valid_from_snapshot_id,valid_to_snapshot_id,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status,valid_from_snapshot_id=EXCLUDED.valid_from_snapshot_id,valid_to_snapshot_id=EXCLUDED.valid_to_snapshot_id", [item.id, item.projectId, item.type, item.domain ?? null, item.title, item.body, item.status, item.state.documented, item.state.implemented, item.state.tested, item.state.deployed, item.state.observed, item.fingerprint, item.entityKey, item.validFromSnapshotId ?? null, item.validToSnapshotId ?? null, item.createdAt]); }
 async function upsertProvenance(client: PoolClient, item: Provenance): Promise<void> { await client.query("INSERT INTO provenance (id,knowledge_item_id,source_artifact_id,source_type,source_ref,repository_commit,path,start_line,end_line,metadata_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) ON CONFLICT (id) DO NOTHING", [item.id, item.knowledgeItemId, item.sourceArtifactId ?? null, item.sourceType, item.sourceRef, item.repositoryCommit ?? null, item.path ?? null, item.startLine ?? null, item.endLine ?? null, parameterJson(item.metadata)]); }
 async function upsertDeployment(client: PoolClient, item: Deployment): Promise<void> { await client.query("INSERT INTO deployments (id,project_id,source_id,external_id,environment,revision,status,deployed_at,metadata_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT (id) DO UPDATE SET revision=EXCLUDED.revision,status=EXCLUDED.status,deployed_at=EXCLUDED.deployed_at,metadata_json=EXCLUDED.metadata_json", [item.id, item.projectId, item.sourceId, item.externalId, item.environment, item.revision ?? null, item.status, item.deployedAt, parameterJson(item.metadata)]); }

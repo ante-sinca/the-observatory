@@ -230,7 +230,7 @@ export class RefreshOrchestrator {
 
   private upsertArtifact(projectId: string, sourceId: string, externalId: string, path: string, revision: string, content: string): SourceArtifact {
     const hash = sha256(content);
-    const found = this.store.artifacts.find((artifact) => artifact.sourceId === sourceId && artifact.path === path && artifact.revision === revision && artifact.contentHash === hash);
+    const found = this.store.artifacts.find((artifact) => artifact.sourceId === sourceId && artifact.externalId === externalId && artifact.path === path && artifact.revision === revision && artifact.contentHash === hash);
     const now = this.clock().toISOString();
     if (found) {
       found.lastSeenAt = now;

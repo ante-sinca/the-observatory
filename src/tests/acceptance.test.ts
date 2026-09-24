@@ -17,9 +17,10 @@ class RepositoryFixture implements SourceAdapter {
   readonly kind = "fixture";
   revision = "r1";
   files = new Map<string, string>();
+  externalIds = new Map<string, string>();
   async healthCheck(): Promise<HealthResult> { return { state: "healthy", checkedAt: "2026-09-23T00:00:00.000Z" }; }
   async getRevision(): Promise<SourceRevision> { return { value: this.revision, observedAt: "2026-09-23T00:00:00.000Z" }; }
-  async listArtifacts(): Promise<SourceArtifactRef[]> { return [...this.files].map(([path, content]) => ({ externalId: `${this.revision}:${path}`, path, artifactType: "text", size: Buffer.byteLength(content) })); }
+  async listArtifacts(): Promise<SourceArtifactRef[]> { return [...this.files].map(([path, content]) => ({ externalId: this.externalIds.get(path) ?? `${this.revision}:${path}`, path, artifactType: "text", size: Buffer.byteLength(content) })); }
   async readArtifact(_config: SourceConfig, artifact: SourceArtifactRef): Promise<ArtifactContent> { const content = this.files.get(artifact.path); if (content === undefined) throw new Error("missing fixture content"); return { content, encoding: "utf8" }; }
 }
 
@@ -64,6 +65,26 @@ test("an unchanged refresh is idempotent and produces no movement noise", async 
   assert.equal(second.idempotent, true);
   assert.equal(store.snapshots.length, 1);
   assert.equal(store.movements.length, 1);
+});
+
+test("shared Git blobs at separate paths retain distinct artifact provenance", async () => {
+  const { store, registry, refresh, repository, queries } = setup();
+  const shared = "# Shared blob\nEvidence with independent path provenance.";
+  repository.files.set("docs/alpha.md", shared);
+  repository.files.set("docs/beta.md", shared);
+  repository.externalIds.set("docs/alpha.md", "git-blob-sha");
+  repository.externalIds.set("docs/beta.md", "git-blob-sha");
+  const project = await registry.createProject({ slug: "shared-blob", name: "Shared Blob" });
+  const source = await registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
+  const first = await refresh.refresh(project.id);
+  assert.ok(first.snapshot);
+  assert.equal(store.artifacts.filter((artifact) => artifact.sourceId === source.id).length, 2);
+  assert.deepEqual(store.artifacts.filter((artifact) => artifact.sourceId === source.id).map((artifact) => artifact.path).sort(), ["docs/alpha.md", "docs/beta.md"]);
+  assert.deepEqual(queries.getKnowledge(project.id).flatMap((record) => record.provenance.map((provenance) => provenance.path)).filter((path): path is string => Boolean(path)).sort(), ["docs/alpha.md", "docs/beta.md"]);
+  const second = await refresh.refresh(project.id);
+  assert.equal(second.idempotent, true);
+  assert.equal(store.artifacts.filter((artifact) => artifact.sourceId === source.id).length, 2);
+  assert.equal(store.snapshots.filter((snapshot) => snapshot.projectId === project.id).length, 1);
 });
 
 test("secret-pattern files can never be ingested", async () => {

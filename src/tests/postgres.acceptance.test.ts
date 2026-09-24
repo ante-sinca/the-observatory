@@ -11,16 +11,17 @@ import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
 import { ProjectRegistry } from "../services/project-registry.js";
 import { ProjectQueryService } from "../services/query.js";
 import { runMigrations } from "../core/migrations.js";
-import type { ArtifactContent, DeploymentAdapter, DeploymentRecord, HealthResult, SourceAdapter, SourceArtifactRef, SourceConfig, SourceRevision } from "../domain/types.js";
+import type { ArtifactContent, DeploymentAdapter, DeploymentRecord, HealthResult, RefreshRun, Snapshot, SourceAdapter, SourceArtifact, SourceArtifactRef, SourceConfig, SourceRevision } from "../domain/types.js";
 
 class RepositoryFixture implements SourceAdapter {
   readonly kind: string;
   revision = "r1";
   files = new Map<string, string>();
+  blobIds = new Map<string, string>();
   constructor(kind = "postgres-fixture") { this.kind = kind; }
   async healthCheck(): Promise<HealthResult> { return { state: "healthy", checkedAt: "2026-09-23T00:00:00.000Z" }; }
   async getRevision(): Promise<SourceRevision> { return { value: this.revision, observedAt: "2026-09-23T00:00:00.000Z" }; }
-  async listArtifacts(): Promise<SourceArtifactRef[]> { return [...this.files].map(([path, content]) => ({ externalId: `${this.revision}:${path}`, path, artifactType: "text", size: Buffer.byteLength(content) })); }
+  async listArtifacts(): Promise<SourceArtifactRef[]> { return [...this.files].map(([path, content]) => ({ externalId: this.blobIds.get(path) ?? `${this.revision}:${path}`, path, artifactType: "text", size: Buffer.byteLength(content) })); }
   async readArtifact(_config: SourceConfig, artifact: SourceArtifactRef): Promise<ArtifactContent> { const content = this.files.get(artifact.path); if (!content) throw new Error("fixture artifact missing"); return { content, encoding: "utf8" }; }
 }
 
@@ -53,7 +54,72 @@ test("missing PostgreSQL configuration is rejected before production startup", a
   }
 });
 
+test("PostgreSQL artifact identity keeps shared Git blobs distinct by path", { skip: connectionString ? false : "Set OBSERVATORY_TEST_DATABASE_URL only for the dedicated Observatory Neon database." }, async () => {
+  await runMigrations({ connectionString });
+  const suffix = randomUUID().slice(0, 8);
+  const repository = new RepositoryFixture(`postgres-shared-blob-${suffix}`);
+  const sharedContent = "# Shared blob\nEvidence retained at two independent repository paths.";
+  repository.files.set("docs/alpha.md", sharedContent);
+  repository.files.set("docs/beta.md", sharedContent);
+  repository.blobIds.set("docs/alpha.md", "shared-git-blob-sha");
+  repository.blobIds.set("docs/beta.md", "shared-git-blob-sha");
+  const adapters = new AdapterRegistry().registerRepository(repository);
+  const first = new PostgresStore(cipher, connectionString);
+  await first.ready();
+  const registry = new ProjectRegistry(first, cipher);
+  const project = await registry.createProject({ slug: `shared-blob-${suffix}`, name: `Shared blob ${suffix}` });
+  const source = await registry.addSource(project.id, { type: "repository", provider: repository.kind, config: { readOnly: true } });
+  const refresh = new RefreshOrchestrator(first, adapters);
+  const initial = await refresh.refresh(project.id);
+  assert.ok(initial.snapshot);
+  const initialSnapshotId = initial.snapshot!.id;
+  const artifacts = first.artifacts.filter((artifact) => artifact.sourceId === source.id);
+  assert.equal(artifacts.length, 2);
+  assert.deepEqual(artifacts.map((artifact) => artifact.path).sort(), ["docs/alpha.md", "docs/beta.md"]);
+  assert.deepEqual([...new Set(artifacts.map((artifact) => artifact.externalId))], ["shared-git-blob-sha"]);
+  const provenancePaths = new ProjectQueryService(first).getKnowledge(project.id).flatMap((record) => record.provenance.map((provenance) => provenance.path)).filter((path): path is string => Boolean(path)).sort();
+  assert.deepEqual(provenancePaths, ["docs/alpha.md", "docs/beta.md"]);
+
+  const duplicate = await refresh.refresh(project.id);
+  assert.equal(duplicate.idempotent, true);
+  assert.equal(first.artifacts.filter((artifact) => artifact.sourceId === source.id).length, 2);
+  assert.equal(first.snapshots.filter((snapshot) => snapshot.projectId === project.id).length, 1);
+  await first.close();
+
+  // A newly hydrated application instance reaches the same identity and
+  // leaves the original immutable snapshot and artifact provenance unchanged.
+  const second = new PostgresStore(cipher, connectionString);
+  await second.ready();
+  const secondRefresh = new RefreshOrchestrator(second, adapters);
+  const afterRestart = await secondRefresh.refresh(project.id);
+  assert.equal(afterRestart.idempotent, true);
+  assert.equal(second.artifacts.filter((artifact) => artifact.sourceId === source.id).length, 2);
+  assert.equal(new ProjectQueryService(second).getProjectState(project.id).snapshot?.id, initialSnapshotId);
+
+  // The durable store flush is one transaction. A source/project isolation
+  // violation staged after a run and snapshot must roll the whole transition
+  // back, not leave a partial run or snapshot in PostgreSQL.
+  const persistedRunCount = second.refreshRuns.filter((run) => run.projectId === project.id).length;
+  const persistedSnapshotCount = second.snapshots.filter((snapshot) => snapshot.projectId === project.id).length;
+  const persistedArtifactCount = second.artifacts.filter((artifact) => artifact.sourceId === source.id).length;
+  const now = "2026-09-24T00:00:00.000Z";
+  second.refreshRuns.push({ id: randomUUID(), projectId: project.id, startedAt: now, completedAt: now, status: "failed", sourceRevisions: {}, errors: [{ message: "forced transaction rollback" }] } satisfies RefreshRun);
+  second.snapshots.push(Object.freeze({ id: randomUUID(), projectId: project.id, createdAt: now, sourceHealth: {}, summary: { knowledgeCount: 0, byType: {}, resolution: "uncertain" }, knowledgeItemIds: [] }) as Snapshot);
+  second.artifacts.push({ id: randomUUID(), projectId: randomUUID(), sourceId: source.id, externalId: "rollback-blob", path: "docs/rollback.md", artifactType: "text", revision: "r1", contentHash: "rollback-hash", content: "rollback", metadata: {}, firstSeenAt: now, lastSeenAt: now } satisfies SourceArtifact);
+  await assert.rejects(() => second.flush(), /source artifact project does not match source project/);
+  await second.close();
+
+  const third = new PostgresStore(cipher, connectionString);
+  await third.ready();
+  assert.equal(third.refreshRuns.filter((run) => run.projectId === project.id).length, persistedRunCount);
+  assert.equal(third.snapshots.filter((snapshot) => snapshot.projectId === project.id).length, persistedSnapshotCount);
+  assert.equal(third.artifacts.filter((artifact) => artifact.sourceId === source.id).length, persistedArtifactCount);
+  assert.equal(new ProjectQueryService(third).getProjectState(project.id).snapshot?.id, initialSnapshotId);
+  await third.close();
+});
+
 test("PostgreSQL durable-store release gates", { skip: connectionString ? false : "Set OBSERVATORY_TEST_DATABASE_URL only for the dedicated Observatory Neon database." }, async () => {
+  await runMigrations({ connectionString });
   const suffix = randomUUID().slice(0, 8);
   const repository = new RepositoryFixture();
   repository.files.set("README.md", "# Durable state\nAPI_KEY=source-material-secret\nEvidence is preserved.");
