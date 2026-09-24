@@ -300,7 +300,9 @@ function canonicalTerm(value: string): string {
 }
 
 function scoreText(path: string, title: string, body: string, content: string, terms: string[], primary: string[]): { score: number; terms: string[]; primary: string[] } {
-  const fields: Array<[string, number]> = [[normalizeSearch(path), 7], [normalizeSearch(title), 5], [normalizeSearch(body), 3], [normalizeSearch(content), 2]];
+  // Score source and knowledge text at the most relevant line, rather than
+  // accumulating broad words scattered through a long document.
+  const fields: Array<[string, number]> = [[normalizeSearch(path), 7], [normalizeSearch(title), 5], [normalizeSearch(mostRelevantLine(body, terms, primary)), 3], [normalizeSearch(mostRelevantLine(content, terms, primary)), 2]];
   let score = 0;
   const matched: string[] = [];
   const primaryMatches: string[] = [];
@@ -363,13 +365,31 @@ function locateLine(content: string, terms: string[], primary: string[]): { star
   const lines = safeText(content).replace(/\r/g, "").split("\n");
   let best: { index: number; hits: number; primaryMatchCount: number } | undefined;
   for (const [index, line] of lines.entries()) {
-    const normalized = normalizeSearch(line);
-    const primaryMatchCount = primary.filter((term) => containsTerm(normalized, term)).length;
-    const hits = terms.reduce((total, term) => total + (containsTerm(normalized, term) ? primary.includes(term) ? 5 : 1 : 0), 0) + adjacentPhrases(primary).filter((phrase) => normalized.includes(phrase)).length * 10;
+    const { hits, primaryMatchCount } = lineMatchStrength(line, terms, primary);
     if (!best || hits > best.hits) best = { index, hits, primaryMatchCount };
   }
   if (!best || best.hits === 0) return undefined;
   return { startLine: best.index + 1, endLine: best.index + 1, excerpt: compactExcerpt(lines[best.index] ?? ""), primaryMatchCount: best.primaryMatchCount };
+}
+
+function mostRelevantLine(value: string, terms: string[], primary: string[]): string {
+  let best = "";
+  let bestHits = 0;
+  for (const line of safeText(value).replace(/\r/g, "").split("\n")) {
+    const { hits } = lineMatchStrength(line, terms, primary);
+    if (hits > bestHits) {
+      best = line;
+      bestHits = hits;
+    }
+  }
+  return best;
+}
+
+function lineMatchStrength(line: string, terms: string[], primary: string[]): { hits: number; primaryMatchCount: number } {
+  const normalized = normalizeSearch(line);
+  const primaryMatchCount = primary.filter((term) => containsTerm(normalized, term)).length;
+  const hits = terms.reduce((total, term) => total + (containsTerm(normalized, term) ? primary.includes(term) ? 5 : 1 : 0), 0) + adjacentPhrases(primary).filter((phrase) => normalized.includes(phrase)).length * 10;
+  return { hits, primaryMatchCount };
 }
 
 function validRange(provenance: Provenance | undefined): { startLine: number; endLine: number; excerpt: string; primaryMatchCount: number } | undefined {
