@@ -304,7 +304,9 @@ function scoreText(path: string, title: string, body: string, content: string, t
   const primaryMatches: string[] = [];
   for (const term of terms) {
     let count = 0;
-    for (const [field, weight] of fields) count += occurrences(field, term) * weight;
+    // Repeated boilerplate in a large README must not outrank a concise,
+    // current implementation simply because it repeats a query word.
+    for (const [field, weight] of fields) count += Math.min(occurrences(field, term), 2) * weight;
     if (count > 0) {
       const exactTopical = primary.includes(term);
       score += Math.min(count, 24) * (exactTopical ? 5 : 1);
