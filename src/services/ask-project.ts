@@ -398,7 +398,7 @@ function validRange(provenance: Provenance | undefined): { startLine: number; en
 }
 
 function selectEvidence(candidates: Candidate[], intent: QuestionIntent): AnswerEvidence[] {
-  const sorted = [...candidates].sort((left, right) => right.score - left.score || evidenceKey(left).localeCompare(evidenceKey(right)));
+  const sorted = [...candidates].sort((left, right) => evidencePrecedence(intent, right.role) - evidencePrecedence(intent, left.role) || right.score - left.score || evidenceKey(left).localeCompare(evidenceKey(right)));
   const selected: Candidate[] = [];
   const seen = new Set<string>();
   const take = (candidate: Candidate | undefined): void => {
@@ -417,8 +417,21 @@ function selectEvidence(candidates: Candidate[], intent: QuestionIntent): Answer
   for (const role of preferredRoles[intent] ?? []) take(sorted.find((candidate) => candidate.role === role));
   for (const candidate of sorted) take(candidate);
   return selected
-    .sort((left, right) => right.score - left.score || evidenceKey(left).localeCompare(evidenceKey(right)))
+    .sort((left, right) => evidencePrecedence(intent, right.role) - evidencePrecedence(intent, left.role) || right.score - left.score || evidenceKey(left).localeCompare(evidenceKey(right)))
     .map((candidate) => toAnswerEvidence(candidate));
+}
+
+function evidencePrecedence(intent: QuestionIntent, role: EvidenceRole): number {
+  const precedences: Record<QuestionIntent, EvidenceRole[]> = {
+    location: ["runtime_implementation", "configuration", "database_schema", "admin_ui", "test", "migration", "documentation", "historical_configuration", "deployment_evidence", "other"],
+    behavior: ["runtime_implementation", "configuration", "database_schema", "test", "admin_ui", "documentation", "migration", "historical_configuration", "deployment_evidence", "other"],
+    change_path: ["configuration", "admin_ui", "runtime_implementation", "database_schema", "test", "documentation", "migration", "historical_configuration", "deployment_evidence", "other"],
+    history: ["historical_configuration", "migration", "documentation", "runtime_implementation", "configuration", "database_schema", "test", "admin_ui", "deployment_evidence", "other"],
+    tests: ["test", "runtime_implementation", "configuration", "database_schema", "documentation", "historical_configuration", "migration", "admin_ui", "deployment_evidence", "other"],
+    state_config: ["configuration", "admin_ui", "runtime_implementation", "database_schema", "documentation", "test", "migration", "historical_configuration", "deployment_evidence", "other"],
+  };
+  const index = precedences[intent].indexOf(role);
+  return index < 0 ? 0 : precedences[intent].length - index;
 }
 
 function evidenceKey(candidate: Candidate): string { return candidate.artifact?.id ?? `${candidate.provenance?.id ?? ""}:${candidate.item?.id ?? ""}`; }

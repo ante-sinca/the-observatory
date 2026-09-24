@@ -79,8 +79,11 @@ test("AskProjectService ranks current scoped evidence and expands related fee te
 
   const fees = await ask.ask("homegift", "How are platform fees configured?");
   assert.equal(fees.status, "verified_current");
-  assert.equal(fees.evidence[0]?.role, "runtime_implementation");
+  assert.equal(fees.evidence[0]?.role, "configuration");
   assert.ok(fees.evidence.some((item) => item.path === "src/billing/fees.ts"));
+
+  const behaviour = await ask.ask("homegift", "How does the service fee calculation work?");
+  assert.equal(behaviour.evidence[0]?.role, "runtime_implementation");
 });
 
 test("AskProjectService keeps HomeGift and HomeBound evidence isolated", async () => {
