@@ -1,5 +1,7 @@
 {
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
+    { "source": "/", "destination": "/api?__observatory_path=/" },
     { "source": "/:path*", "destination": "/api?__observatory_path=/:path*" }
   ]
 }

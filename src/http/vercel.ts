@@ -5,19 +5,22 @@ import { handleHttpRequest } from "./server.js";
 type Observatory = Awaited<ReturnType<typeof createObservatory>>;
 let observatory: Promise<Observatory> | undefined;
 
+/** Restores the public path after Vercel rewrites it to the thin /api adapter. */
+export function restoreVercelRequestUrl(requestUrl: string | undefined, host = "localhost"): string {
+  const rewritten = new URL(requestUrl ?? "/", `http://${host}`);
+  const originalPath = rewritten.searchParams.get("__observatory_path");
+  if (originalPath === null) return `${rewritten.pathname}${rewritten.search}`;
+  rewritten.searchParams.delete("__observatory_path");
+  return `${originalPath.startsWith("/") ? originalPath : `/${originalPath}`}${rewritten.search}`;
+}
+
 export function createVercelHandler(services: Promise<Observatory>) {
   return async function vercelHandler(request: IncomingMessage, response: ServerResponse): Promise<void> {
   try {
     // vercel.json rewrites every public path to /api and carries the original
     // path in a reserved query parameter so the framework-neutral router sees
     // /health, /, and all API/MCP paths exactly as it does under node:http.
-    const rewritten = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
-    const originalPath = rewritten.searchParams.get("__observatory_path");
-    if (originalPath) {
-      rewritten.searchParams.delete("__observatory_path");
-      const query = rewritten.searchParams.toString();
-      request.url = `${originalPath.startsWith("/") ? originalPath : `/${originalPath}`}${query ? `?${query}` : ""}`;
-    }
+    request.url = restoreVercelRequestUrl(request.url, request.headers.host ?? "localhost");
     // A warm serverless instance may have served another invocation before a
     // different instance committed data. Rehydrate before every request so
     // response correctness never depends on sticky process memory.

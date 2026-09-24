@@ -7,7 +7,7 @@ import { ConfigCipher, isAllowedArtifact } from "../core/security.js";
 import { MemoryStore } from "../core/store.js";
 import { ObservatoryToolService } from "../mcp/tools.js";
 import { createHttpServer } from "../http/server.js";
-import { createVercelHandler } from "../http/vercel.js";
+import { createVercelHandler, restoreVercelRequestUrl } from "../http/vercel.js";
 import { createObservatory } from "../index.js";
 import { ProjectRegistry } from "../services/project-registry.js";
 import { ProjectQueryService } from "../services/query.js";
@@ -179,6 +179,71 @@ test("HTTP project administration and read-only MCP discovery use the shared ser
   }
 });
 
+test("browser navigation renders the dashboard and projects index from shared project queries", async () => {
+  const { registry, refresh, queries, tools } = setup();
+  await registry.createProject({ slug: "homebound", name: "HomeBound" });
+  await registry.createProject({ slug: "homegift", name: "HomeGift" });
+  const server = createHttpServer({ registry, refresh, queries, tools });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const dashboard = await fetch(`http://127.0.0.1:${port}/`);
+    assert.equal(dashboard.status, 200);
+    assert.match(dashboard.headers.get("content-type") ?? "", /text\/html/);
+    const dashboardHtml = await dashboard.text();
+    assert.match(dashboardHtml, /Project Observatory/);
+    assert.match(dashboardHtml, /href="\/projects"/);
+
+    const projects = await fetch(`http://127.0.0.1:${port}/projects`);
+    assert.equal(projects.status, 200);
+    assert.match(projects.headers.get("content-type") ?? "", /text\/html/);
+    const projectsHtml = await projects.text();
+    assert.match(projectsHtml, /HomeBound/);
+    assert.match(projectsHtml, /HomeGift/);
+    assert.match(projectsHtml, /href="\/projects\/homebound"/);
+    assert.match(projectsHtml, /href="\/projects\/homegift"/);
+
+    const project = await fetch(`http://127.0.0.1:${port}/projects/homebound`);
+    assert.equal(project.status, 200);
+    const projectHtml = await project.text();
+    assert.match(projectHtml, /href="\/">Home<\/a>/);
+    assert.match(projectHtml, /href="\/projects">Projects<\/a>/);
+    assert.match(projectHtml, /Overview/);
+    assert.match(projectHtml, /State/);
+    assert.match(projectHtml, /Knowledge/);
+    assert.match(projectHtml, /Movements/);
+    assert.match(projectHtml, /Sources/);
+
+    const projectState = await fetch(`http://127.0.0.1:${port}/projects/homebound/state`);
+    assert.equal(projectState.status, 200);
+    assert.match(projectState.headers.get("content-type") ?? "", /text\/html/);
+
+    const apiProjects = await fetch(`http://127.0.0.1:${port}/api/projects`);
+    assert.equal(apiProjects.status, 200);
+    assert.match(apiProjects.headers.get("content-type") ?? "", /application\/json/);
+    assert.deepEqual((await apiProjects.json() as Array<{ slug: string }>).map((project) => project.slug), ["homebound", "homegift"]);
+
+    const unknownApi = await fetch(`http://127.0.0.1:${port}/api/not-a-route`);
+    assert.equal(unknownApi.status, 404);
+    assert.match(unknownApi.headers.get("content-type") ?? "", /application\/json/);
+    assert.deepEqual(await unknownApi.json(), { error: "Route not found." });
+
+    const unknownBrowser = await fetch(`http://127.0.0.1:${port}/not-a-route`);
+    assert.equal(unknownBrowser.status, 404);
+    assert.match(unknownBrowser.headers.get("content-type") ?? "", /text\/html/);
+    const unknownBrowserHtml = await unknownBrowser.text();
+    assert.match(unknownBrowserHtml, /Page not found/);
+    assert.match(unknownBrowserHtml, /href="\/">Home<\/a>/);
+    assert.match(unknownBrowserHtml, /href="\/projects">Projects<\/a>/);
+
+    const health = await fetch(`http://127.0.0.1:${port}/health`);
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { status: "ok", service: "project-observatory", version: "0.1.0" });
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test("the Vercel adapter preserves the public route for the shared HTTP router", async () => {
   // The Vercel handler is intentionally a thin function, not a replacement
   // HTTP implementation. This uses Node's adapter shape to exercise its path
@@ -192,10 +257,18 @@ test("the Vercel adapter preserves the public route for the shared HTTP router",
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const port = (server.address() as AddressInfo).port;
-    const response = await fetch(`http://127.0.0.1:${port}/api?__observatory_path=/health`);
-    assert.equal(response.status, 200);
-    assert.equal((await response.json() as { status: string }).status, "ok");
-    assert.equal(reloads, 1);
+    assert.equal(restoreVercelRequestUrl("/api?__observatory_path=/"), "/");
+    assert.equal(restoreVercelRequestUrl("/api?__observatory_path=%2Fprojects%2Fhomebound%2Fstate&since=snapshot-1&limit=2"), "/projects/homebound/state?since=snapshot-1&limit=2");
+
+    const root = await fetch(`http://127.0.0.1:${port}/api?__observatory_path=/`);
+    assert.equal(root.status, 200);
+    assert.match(root.headers.get("content-type") ?? "", /text\/html/);
+    assert.match(await root.text(), /Project Observatory/);
+
+    const health = await fetch(`http://127.0.0.1:${port}/api?__observatory_path=/health`);
+    assert.equal(health.status, 200);
+    assert.equal((await health.json() as { status: string }).status, "ok");
+    assert.equal(reloads, 2);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
