@@ -71,6 +71,7 @@ interface Candidate {
   current: boolean;
   score: number;
   matchedTerms: string[];
+  primaryMatches: string[];
   line?: { startLine: number; endLine: number; excerpt: string };
 }
 
@@ -115,6 +116,7 @@ export class AskProjectService {
 
   private retrieve(projectId: string, snapshot: Snapshot, question: string, intent: QuestionIntent): Candidate[] {
     const terms = expandedTerms(question);
+    const primary = primaryTerms(question);
     const topical = topicalTerms(question);
     if (terms.length === 0) return [];
     const currentItems = snapshot.knowledgeItemIds.flatMap((id) => {
@@ -128,12 +130,12 @@ export class AskProjectService {
     // content supplies precise line locations where that content is durable.
     for (const item of currentItems) {
       const provenance = this.store.provenance.filter((candidate) => candidate.knowledgeItemId === item.id);
-      if (provenance.length === 0) candidates.push(this.candidateFor(projectId, item, undefined, undefined, true, terms, intent));
+      if (provenance.length === 0) candidates.push(this.candidateFor(projectId, item, undefined, undefined, true, terms, primary, intent));
       for (const source of provenance) {
         const artifact = source.sourceArtifactId
           ? this.store.artifacts.find((candidate) => candidate.id === source.sourceArtifactId && candidate.projectId === projectId)
           : undefined;
-        candidates.push(this.candidateFor(projectId, item, source, artifact, true, terms, intent));
+        candidates.push(this.candidateFor(projectId, item, source, artifact, true, terms, primary, intent));
       }
     }
 
@@ -143,7 +145,7 @@ export class AskProjectService {
       if (artifact.projectId !== projectId || artifact.content === undefined || !isAllowedArtifact(artifact.path)) continue;
       if (artifact.revision !== snapshot.repositoryRevision) continue;
       const alreadyCovered = candidates.some((candidate) => candidate.artifact?.id === artifact.id);
-      if (!alreadyCovered) candidates.push(this.candidateFor(projectId, undefined, undefined, artifact, true, terms, intent));
+      if (!alreadyCovered) candidates.push(this.candidateFor(projectId, undefined, undefined, artifact, true, terms, primary, intent));
     }
 
     // Historical questions may inspect prior durable evidence, but it is never
@@ -156,15 +158,15 @@ export class AskProjectService {
           const artifact = source.sourceArtifactId
             ? this.store.artifacts.find((candidate) => candidate.id === source.sourceArtifactId && candidate.projectId === projectId)
             : undefined;
-          candidates.push(this.candidateFor(projectId, item, source, artifact, false, terms, intent));
+          candidates.push(this.candidateFor(projectId, item, source, artifact, false, terms, primary, intent));
         }
       }
     }
 
-    return candidates.filter((candidate) => candidate.score > 0 && (topical.length === 0 || candidate.matchedTerms.some((term) => topical.includes(term))));
+    return candidates.filter((candidate) => candidate.score > 0 && (topical.length === 0 || candidate.matchedTerms.some((term) => topical.includes(term))) && (primary.length === 0 || candidate.primaryMatches.length > 0));
   }
 
-  private candidateFor(projectId: string, item: KnowledgeItem | undefined, provenance: Provenance | undefined, artifact: SourceArtifact | undefined, current: boolean, terms: string[], intent: QuestionIntent): Candidate {
+  private candidateFor(projectId: string, item: KnowledgeItem | undefined, provenance: Provenance | undefined, artifact: SourceArtifact | undefined, current: boolean, terms: string[], primary: string[], intent: QuestionIntent): Candidate {
     // Project checks on every source prevent a malformed provenance relation
     // from ever crossing the service boundary, even before database triggers.
     if (item && item.projectId !== projectId) throw new Error("Evidence does not belong to the requested project.");
@@ -174,8 +176,8 @@ export class AskProjectService {
     const title = item?.title ?? "";
     const body = item?.body ?? "";
     const content = artifact?.content ?? "";
-    const match = scoreText(path, title, body, content, terms);
-    const line = artifact?.content ? locateLine(artifact.content, terms) : undefined;
+    const match = scoreText(path, title, body, content, terms, primary);
+    const line = artifact?.content ? locateLine(artifact.content, terms, primary) : undefined;
     const provenanceLine = line ? undefined : validRange(provenance);
     const score = match.score + intentWeight(intent, role) + (current ? 10 : 0);
     return {
@@ -186,6 +188,7 @@ export class AskProjectService {
       current,
       score,
       matchedTerms: match.terms,
+      primaryMatches: match.primary,
       line: line ?? provenanceLine,
     };
   }
@@ -260,8 +263,10 @@ function latestSnapshot(store: ObservatoryStore, projectId: string): Snapshot | 
 }
 
 function expandedTerms(question: string): string[] {
-  return expandTermList(tokenize(question).map(canonicalTerm).filter((term) => term.length > 1 && !STOP_WORDS.has(term)));
+  return expandTermList(primaryTerms(question));
 }
+
+function primaryTerms(question: string): string[] { return tokenize(question).map(canonicalTerm).filter((term) => term.length > 1 && !STOP_WORDS.has(term)); }
 
 function topicalTerms(question: string): string[] {
   const intentOnly = new Set(["behaviour", "behavior", "change", "chang", "config", "configuration", "configur", "configure", "coverage", "edit", "establish", "feature", "history", "how", "introduc", "modify", "origin", "safe", "safely", "setting", "state", "test", "update", "work", "works"]);
@@ -292,22 +297,28 @@ function canonicalTerm(value: string): string {
   return value;
 }
 
-function scoreText(path: string, title: string, body: string, content: string, terms: string[]): { score: number; terms: string[] } {
+function scoreText(path: string, title: string, body: string, content: string, terms: string[], primary: string[]): { score: number; terms: string[]; primary: string[] } {
   const fields: Array<[string, number]> = [[normalizeSearch(path), 7], [normalizeSearch(title), 5], [normalizeSearch(body), 3], [normalizeSearch(content), 2]];
   let score = 0;
   const matched: string[] = [];
+  const primaryMatches: string[] = [];
   for (const term of terms) {
     let count = 0;
     for (const [field, weight] of fields) count += occurrences(field, term) * weight;
     if (count > 0) {
-      score += Math.min(count, 24);
+      const exactTopical = primary.includes(term);
+      score += Math.min(count, 24) * (exactTopical ? 5 : 1);
       matched.push(term);
+      if (exactTopical) primaryMatches.push(term);
     }
+  }
+  for (const phrase of adjacentPhrases(primary)) {
+    if (fields.some(([field]) => field.includes(phrase))) score += phrase.split(" ").length * 35;
   }
   // Require at least one query/concept term, and favour candidates that
   // corroborate more than one distinct term over a generic one-word match.
   if (matched.length > 1) score += (matched.length - 1) * 6;
-  return { score, terms: matched };
+  return { score, terms: matched, primary: primaryMatches };
 }
 
 function occurrences(text: string, term: string): number {
@@ -316,7 +327,8 @@ function occurrences(text: string, term: string): number {
 }
 function containsTerm(text: string, term: string): boolean { return occurrences(text, term) > 0; }
 function escapeRegExp(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-function normalizeSearch(value: string): string { return value.replace(/([a-z\d])([A-Z])/g, "$1 $2").replace(/[_./-]+/g, " ").toLocaleLowerCase(); }
+function normalizeSearch(value: string): string { return value.replace(/([a-z\d])([A-Z])/g, "$1 $2").replace(/[^\p{L}\p{N}]+/gu, " ").split(/\s+/).filter(Boolean).map(canonicalTerm).join(" "); }
+function adjacentPhrases(terms: string[]): string[] { return terms.flatMap((term, index) => index + 1 < terms.length ? [`${term} ${terms[index + 1]}`] : []); }
 
 function evidenceRole(path: string | undefined, item: KnowledgeItem | undefined): EvidenceRole {
   const lower = (path ?? "").toLocaleLowerCase();
@@ -343,11 +355,12 @@ function intentWeight(intent: QuestionIntent, role: EvidenceRole): number {
   return weights[intent][role] ?? 0;
 }
 
-function locateLine(content: string, terms: string[]): { startLine: number; endLine: number; excerpt: string } | undefined {
+function locateLine(content: string, terms: string[], primary: string[]): { startLine: number; endLine: number; excerpt: string } | undefined {
   const lines = safeText(content).replace(/\r/g, "").split("\n");
   let best: { index: number; hits: number } | undefined;
   for (const [index, line] of lines.entries()) {
-    const hits = terms.filter((term) => containsTerm(normalizeSearch(line), term)).length;
+    const normalized = normalizeSearch(line);
+    const hits = terms.reduce((total, term) => total + (containsTerm(normalized, term) ? primary.includes(term) ? 5 : 1 : 0), 0) + adjacentPhrases(primary).filter((phrase) => normalized.includes(phrase)).length * 10;
     if (!best || hits > best.hits) best = { index, hits };
   }
   if (!best || best.hits === 0) return undefined;
