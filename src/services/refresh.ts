@@ -145,6 +145,16 @@ export class RefreshOrchestrator {
     return health;
   }
 
+  /** Tests a repository source before it is durably registered. */
+  async testRepositoryConnection(provider: string, config: import("../domain/types.js").SourceConfig): Promise<{ health: HealthResult; revision?: string }> {
+    const adapter = this.adapters.repository(provider);
+    if (!adapter) throw new Error(`No repository adapter is registered for '${provider}'.`);
+    const health = await adapter.healthCheck(config);
+    if (health.state !== "healthy") return { health };
+    const revision = await adapter.getRevision(config);
+    return { health, revision: revision.value };
+  }
+
   private async refreshRepository(projectId: string, source: ProjectSource, run: RefreshRun, currentItemIds: Set<string>, sourceHealth: Record<string, HealthResult>): Promise<{ success: boolean; revision?: string }> {
     const adapter = this.adapters.repository(source.provider);
     if (!adapter) return this.failure(source, run, sourceHealth, `No repository adapter is registered for '${source.provider}'.`);

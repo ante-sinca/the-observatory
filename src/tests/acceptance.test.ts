@@ -14,13 +14,16 @@ import { ProjectQueryService } from "../services/query.js";
 import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
 
 class RepositoryFixture implements SourceAdapter {
-  readonly kind = "fixture";
+  readonly kind: string;
   revision = "r1";
   files = new Map<string, string>();
   externalIds = new Map<string, string>();
-  async healthCheck(): Promise<HealthResult> { return { state: "healthy", checkedAt: "2026-09-23T00:00:00.000Z" }; }
+  unavailable = false;
+  failArtifactListing = false;
+  constructor(kind = "fixture") { this.kind = kind; }
+  async healthCheck(): Promise<HealthResult> { return this.unavailable ? { state: "unavailable", checkedAt: "2026-09-23T00:00:00.000Z", message: "fixture unavailable" } : { state: "healthy", checkedAt: "2026-09-23T00:00:00.000Z" }; }
   async getRevision(): Promise<SourceRevision> { return { value: this.revision, observedAt: "2026-09-23T00:00:00.000Z" }; }
-  async listArtifacts(): Promise<SourceArtifactRef[]> { return [...this.files].map(([path, content]) => ({ externalId: this.externalIds.get(path) ?? `${this.revision}:${path}`, path, artifactType: "text", size: Buffer.byteLength(content) })); }
+  async listArtifacts(): Promise<SourceArtifactRef[]> { if (this.failArtifactListing) throw new Error("fixture artifact listing failed"); return [...this.files].map(([path, content]) => ({ externalId: this.externalIds.get(path) ?? `${this.revision}:${path}`, path, artifactType: "text", size: Buffer.byteLength(content) })); }
   async readArtifact(_config: SourceConfig, artifact: SourceArtifactRef): Promise<ArtifactContent> { const content = this.files.get(artifact.path); if (content === undefined) throw new Error("missing fixture content"); return { content, encoding: "utf8" }; }
 }
 
@@ -35,10 +38,29 @@ function setup() {
   const store = new MemoryStore();
   const registry = new ProjectRegistry(store, ConfigCipher.fromEnvironment(), () => new Date("2026-09-23T00:00:00.000Z"));
   const repository = new RepositoryFixture();
-  const adapters = new AdapterRegistry().registerRepository(repository).registerDeployment(new FailingDeploymentFixture());
+  const github = new RepositoryFixture("github");
+  const adapters = new AdapterRegistry().registerRepository(repository).registerRepository(github).registerDeployment(new FailingDeploymentFixture());
   const refresh = new RefreshOrchestrator(store, adapters, () => new Date("2026-09-23T00:00:00.000Z"));
   const queries = new ProjectQueryService(store);
-  return { store, registry, repository, refresh, queries, tools: new ObservatoryToolService(queries) };
+  return { store, registry, repository, github, refresh, queries, tools: new ObservatoryToolService(queries) };
+}
+
+function cookieHeader(response: Response): string {
+  return response.headers.getSetCookie().map((item) => item.split(";", 1)[0]).filter((item): item is string => Boolean(item)).join("; ");
+}
+
+function combineCookies(...headers: string[]): string {
+  return headers.flatMap((header) => header.split("; ")).filter(Boolean).join("; ");
+}
+
+function csrfFrom(html: string): string {
+  const match = html.match(/name="csrf" value="([^"]+)"/);
+  assert.ok(match?.[1]);
+  return match[1];
+}
+
+async function postForm(url: string, origin: string, cookies: string, fields: Record<string, string>, operatorToken?: string): Promise<Response> {
+  return fetch(url, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded", origin, ...(cookies ? { cookie: cookies } : {}), ...(operatorToken ? { authorization: `Bearer ${operatorToken}` } : {}) }, body: new URLSearchParams(fields) });
 }
 
 test("a second project uses the same project-agnostic core", async () => {
@@ -241,6 +263,155 @@ test("browser navigation renders the dashboard and projects index from shared pr
     assert.deepEqual(await health.json(), { status: "ok", service: "project-observatory", version: "0.1.0" });
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("guided GitHub onboarding validates before persistence and never renders credentials", async () => {
+  const previousOperatorToken = process.env.OBSERVATORY_OPERATOR_TOKEN;
+  const operatorToken = "operator-token-for-test";
+  const providerToken = "github-token-must-never-appear";
+  process.env.OBSERVATORY_OPERATOR_TOKEN = operatorToken;
+  const { store, registry, github, refresh, queries, tools } = setup();
+  github.files.set("README.md", "# New project\nEvidence from GitHub.");
+  const server = createHttpServer({ registry, refresh, queries, tools });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  const origin = `http://127.0.0.1:${port}`;
+  try {
+    const direct = await fetch(`${origin}/projects/new`);
+    assert.equal(direct.status, 200);
+    assert.match(await direct.text(), /Operator authorization required/);
+
+    const start = await fetch(`${origin}/projects/new`, { headers: { authorization: `Bearer ${operatorToken}` } });
+    assert.equal(start.status, 200);
+    const startHtml = await start.text();
+    assert.match(startHtml, /Add project/);
+    assert.match(startHtml, /Fine-grained GitHub token/);
+    assert.match(startHtml, /Metadata: Read-only/);
+    const initialCookies = cookieHeader(start);
+    const csrf = csrfFrom(startHtml);
+
+    const unauthorized = await postForm(`${origin}/projects/new/test`, origin, initialCookies, { csrf, name: "Unauthorised", slug: "", repository: "acme/unauthorised", branch: "main", token: providerToken });
+    assert.equal(unauthorized.status, 403);
+    assert.equal(store.projects.length, 0);
+
+    const unauthorizedCreate = await postForm(`${origin}/projects/new/create`, origin, initialCookies, { csrf });
+    assert.equal(unauthorizedCreate.status, 403);
+    assert.equal(store.projects.length, 0);
+
+    const malformed = await postForm(`${origin}/projects/new/test`, origin, initialCookies, { csrf, name: "Malformed", slug: "", repository: "not-a-repository", branch: "main", token: providerToken }, operatorToken);
+    assert.equal(malformed.status, 400);
+    const malformedHtml = await malformed.text();
+    assert.match(malformedHtml, /owner\/repository/);
+    assert.equal(malformedHtml.includes(providerToken), false);
+    assert.equal(store.projects.length, 0);
+
+    github.unavailable = true;
+    const inaccessible = await postForm(`${origin}/projects/new/test`, origin, initialCookies, { csrf, name: "Inaccessible", slug: "", repository: "acme/inaccessible", branch: "main", token: providerToken }, operatorToken);
+    assert.equal(inaccessible.status, 400);
+    assert.match(await inaccessible.text(), /Repository not accessible with supplied credential/);
+    assert.equal(store.projects.length, 0);
+    github.unavailable = false;
+
+    const tested = await postForm(`${origin}/projects/new/test`, origin, initialCookies, { csrf, name: "A Sensible New Project", slug: "", description: "Read-only onboarding proof", repository: "acme/new-project", branch: "main", token: providerToken }, operatorToken);
+    assert.equal(tested.status, 200);
+    const testedHtml = await tested.text();
+    assert.match(testedHtml, /Connection healthy/);
+    assert.match(testedHtml, /Repository accessible/);
+    assert.match(testedHtml, /Branch: main/);
+    assert.equal(testedHtml.includes(providerToken), false);
+    assert.equal(store.projects.length, 0);
+
+    const onboardingCookies = combineCookies(initialCookies, cookieHeader(tested));
+    const created = await postForm(`${origin}/projects/new/create`, origin, onboardingCookies, { csrf }, operatorToken);
+    assert.equal(created.status, 303);
+    assert.equal(created.headers.get("location"), "/projects/a-sensible-new-project?onboarding=complete");
+    assert.equal(store.projects.length, 1);
+    assert.equal(store.sources.length, 1);
+    assert.equal(store.sources[0]?.config.token, providerToken);
+    assert.equal(store.sources[0]?.encryptedConfig.includes(providerToken), false);
+    assert.equal(store.snapshots.length, 1);
+
+    const projectPage = await fetch(`${origin}/projects/a-sensible-new-project?onboarding=complete`, { headers: { authorization: `Bearer ${operatorToken}` } });
+    assert.equal(projectPage.status, 200);
+    const projectHtml = await projectPage.text();
+    assert.match(projectHtml, /A Sensible New Project onboarded/);
+    assert.match(projectHtml, /Snapshot ID/);
+    assert.equal(projectHtml.includes(providerToken), false);
+
+    const publicSources = await fetch(`${origin}/api/projects/a-sensible-new-project/sources`);
+    assert.equal(publicSources.status, 200);
+    const publicSourceBody = await publicSources.text();
+    assert.equal(publicSourceBody.includes(providerToken), false);
+    assert.equal(publicSourceBody.includes("encryptedConfig"), false);
+
+    const sourcesPage = await fetch(`${origin}/projects/a-sensible-new-project/sources`, { headers: { authorization: `Bearer ${operatorToken}`, cookie: initialCookies } });
+    assert.equal(sourcesPage.status, 200);
+    const sourcesHtml = await sourcesPage.text();
+    assert.match(sourcesHtml, /Test connection/);
+    assert.match(sourcesHtml, /Replace credential/);
+    assert.match(sourcesHtml, /Source type/);
+    assert.match(sourcesHtml, /Last checked/);
+    assert.equal(sourcesHtml.includes(providerToken), false);
+
+    const unauthorizedRefresh = await postForm(`${origin}/projects/a-sensible-new-project/refresh`, origin, initialCookies, { csrf });
+    assert.equal(unauthorizedRefresh.status, 403);
+
+    const replacementToken = "replacement-token-must-never-appear";
+    const sourceId = store.sources[0]?.id;
+    assert.ok(sourceId);
+    const replaced = await postForm(`${origin}/projects/a-sensible-new-project/sources/${sourceId}/credential`, origin, initialCookies, { csrf, token: replacementToken }, operatorToken);
+    assert.equal(replaced.status, 200);
+    const replacedHtml = await replaced.text();
+    assert.match(replacedHtml, /Credential replaced securely/);
+    assert.equal(replacedHtml.includes(providerToken), false);
+    assert.equal(replacedHtml.includes(replacementToken), false);
+    assert.equal(store.sources[0]?.config.token, replacementToken);
+
+    const duplicate = await postForm(`${origin}/projects/new/test`, origin, initialCookies, { csrf, name: "Duplicate", slug: "a-sensible-new-project", repository: "acme/new-project", branch: "main", token: providerToken }, operatorToken);
+    assert.equal(duplicate.status, 400);
+    assert.match(await duplicate.text(), /already exists/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    if (previousOperatorToken === undefined) delete process.env.OBSERVATORY_OPERATOR_TOKEN;
+    else process.env.OBSERVATORY_OPERATOR_TOKEN = previousOperatorToken;
+  }
+});
+
+test("failed first onboarding refresh preserves a retryable project and source", async () => {
+  const previousOperatorToken = process.env.OBSERVATORY_OPERATOR_TOKEN;
+  const operatorToken = "operator-token-for-retry-test";
+  process.env.OBSERVATORY_OPERATOR_TOKEN = operatorToken;
+  const { store, registry, github, refresh, queries, tools } = setup();
+  github.files.set("README.md", "# Retry project\nEvidence.");
+  github.failArtifactListing = true;
+  const server = createHttpServer({ registry, refresh, queries, tools });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  const origin = `http://127.0.0.1:${port}`;
+  try {
+    const start = await fetch(`${origin}/projects/new`, { headers: { authorization: `Bearer ${operatorToken}` } });
+    const startHtml = await start.text();
+    const csrf = csrfFrom(startHtml);
+    const initialCookies = cookieHeader(start);
+    const tested = await postForm(`${origin}/projects/new/test`, origin, initialCookies, { csrf, name: "Retry Project", slug: "retry-project", repository: "acme/retry-project", branch: "main", token: "retry-token" }, operatorToken);
+    assert.equal(tested.status, 200);
+    const created = await postForm(`${origin}/projects/new/create`, origin, combineCookies(initialCookies, cookieHeader(tested)), { csrf }, operatorToken);
+    assert.equal(created.status, 202);
+    assert.match(await created.text(), /Onboarding incomplete — refresh failed/);
+    assert.equal(store.projects.length, 1);
+    assert.equal(store.sources.length, 1);
+    assert.equal(store.refreshRuns.at(-1)?.status, "failed");
+
+    github.failArtifactListing = false;
+    const retried = await postForm(`${origin}/projects/retry-project/refresh`, origin, initialCookies, { csrf }, operatorToken);
+    assert.equal(retried.status, 200);
+    assert.match(await retried.text(), /Refresh success/);
+    assert.ok(store.snapshots.length > 0);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    if (previousOperatorToken === undefined) delete process.env.OBSERVATORY_OPERATOR_TOKEN;
+    else process.env.OBSERVATORY_OPERATOR_TOKEN = previousOperatorToken;
   }
 });
 

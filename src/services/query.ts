@@ -21,6 +21,18 @@ export interface ProjectState {
   latestMovements: Movement[];
 }
 
+export interface OnboardingSummary {
+  repository?: string;
+  repositoryRevision?: string;
+  sourceHealth?: string;
+  refreshStatus?: string;
+  snapshotId?: string;
+  artifactCount: number;
+  knowledgeCount: number;
+  provenanceCount: number;
+  openConflictCount: number;
+}
+
 export interface SearchOptions {
   domain?: string;
   type?: KnowledgeType;
@@ -62,6 +74,24 @@ export class ProjectQueryService {
       summary: snapshot?.summary,
       unresolvedConflicts: this.store.conflicts.filter((conflict) => conflict.projectId === project.id && conflict.status === "open"),
       latestMovements: this.getRecentChanges(project.id).slice(0, 20),
+    };
+  }
+
+  getOnboardingSummary(projectRef: string): OnboardingSummary {
+    const project = this.getProject(projectRef);
+    const snapshot = this.latestSnapshot(project.id);
+    const source = this.store.sources.find((candidate) => candidate.projectId === project.id && candidate.type === "repository");
+    const latestRun = this.store.refreshRuns.filter((candidate) => candidate.projectId === project.id).at(-1);
+    return {
+      repository: typeof source?.config.repository === "string" ? source.config.repository : undefined,
+      repositoryRevision: snapshot?.repositoryRevision,
+      sourceHealth: source?.lastHealth?.state,
+      refreshStatus: latestRun?.status,
+      snapshotId: snapshot?.id,
+      artifactCount: this.store.artifacts.filter((candidate) => candidate.projectId === project.id).length,
+      knowledgeCount: this.store.knowledge.filter((candidate) => candidate.projectId === project.id).length,
+      provenanceCount: this.store.provenance.filter((candidate) => this.store.knowledge.some((item) => item.id === candidate.knowledgeItemId && item.projectId === project.id)).length,
+      openConflictCount: this.store.conflicts.filter((candidate) => candidate.projectId === project.id && candidate.status === "open").length,
     };
   }
 

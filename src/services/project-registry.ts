@@ -24,16 +24,36 @@ export class ProjectRegistry {
   ) {}
 
   async createProject(input: CreateProjectInput, actorId?: string): Promise<Project> {
-    const slug = input.slug.trim().toLowerCase();
-    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug)) throw new Error("Project slug must be kebab-case.");
-    if (!input.name.trim()) throw new Error("Project name is required.");
-    if (this.store.projects.some((project) => project.slug === slug)) throw new Error(`Project slug '${slug}' already exists.`);
-    const now = this.clock().toISOString();
-    const project: Project = { id: randomUUID(), slug, name: input.name.trim(), description: input.description?.trim(), status: "active", createdAt: now, updatedAt: now };
+    const project = this.newProject(input);
     this.store.projects.push(project);
-    this.audit("project.created", { slug }, project.id, actorId);
+    this.audit("project.created", { slug: project.slug }, project.id, actorId);
     await this.store.flush();
     return project;
+  }
+
+  /**
+   * Persists the first source with its project in one store flush. This keeps
+   * onboarding from exposing a project that was never configured to observe.
+   */
+  async createProjectWithSource(projectInput: CreateProjectInput, sourceInput: CreateSourceInput, actorId?: string): Promise<{ project: Project; source: ProjectSource }> {
+    const project = this.newProject(projectInput);
+    const source = this.newSource(project.id, sourceInput);
+    const projectCount = this.store.projects.length;
+    const sourceCount = this.store.sources.length;
+    const auditCount = this.store.auditEvents.length;
+    this.store.projects.push(project);
+    this.store.sources.push(source);
+    this.audit("project.created", { slug: project.slug }, project.id, actorId);
+    this.audit("source.created", { sourceId: source.id, type: source.type, provider: source.provider, at: this.clock().toISOString() }, project.id, actorId);
+    try {
+      await this.store.flush();
+    } catch (error) {
+      this.store.projects.splice(projectCount);
+      this.store.sources.splice(sourceCount);
+      this.store.auditEvents.splice(auditCount);
+      throw error;
+    }
+    return { project, source };
   }
 
   async updateProject(projectId: string, input: Partial<Pick<CreateProjectInput, "name" | "description">>, actorId?: string): Promise<Project> {
@@ -61,20 +81,22 @@ export class ProjectRegistry {
 
   async addSource(projectId: string, input: CreateSourceInput, actorId?: string): Promise<ProjectSource> {
     this.getProject(projectId);
-    if (!input.provider.trim()) throw new Error("Source provider is required.");
-    if (input.config.readOnly === false) throw new Error("Observed-project sources must be configured read-only.");
-    const now = this.clock().toISOString();
-    const source: ProjectSource = {
-      id: randomUUID(),
-      projectId,
-      type: input.type,
-      provider: input.provider.trim().toLowerCase(),
-      config: { ...structuredClone(input.config), readOnly: true },
-      encryptedConfig: this.cipher.encrypt({ ...input.config, readOnly: true }),
-      enabled: input.enabled ?? true,
-    };
+    const source = this.newSource(projectId, input);
     this.store.sources.push(source);
-    this.audit("source.created", { sourceId: source.id, type: source.type, provider: source.provider, at: now }, projectId, actorId);
+    this.audit("source.created", { sourceId: source.id, type: source.type, provider: source.provider, at: this.clock().toISOString() }, projectId, actorId);
+    await this.store.flush();
+    return source;
+  }
+
+  /** Re-encrypts a provider credential without returning or auditing either value. */
+  async replaceSourceCredential(projectId: string, sourceId: string, credential: string, actorId?: string): Promise<ProjectSource> {
+    const source = this.store.sources.find((candidate) => candidate.id === sourceId && candidate.projectId === projectId);
+    if (!source) throw new Error(`Source '${sourceId}' was not found.`);
+    if (!credential.trim()) throw new Error("A replacement credential is required.");
+    const config = { ...structuredClone(source.config), token: credential.trim(), readOnly: true };
+    source.config = config;
+    source.encryptedConfig = this.cipher.encrypt(config);
+    this.audit("source.credential_replaced", { sourceId: source.id }, projectId, actorId);
     await this.store.flush();
     return source;
   }
@@ -82,6 +104,22 @@ export class ProjectRegistry {
   getSources(projectId: string): ProjectSource[] {
     this.getProject(projectId);
     return this.store.sources.filter((source) => source.projectId === projectId);
+  }
+
+  private newProject(input: CreateProjectInput): Project {
+    const slug = input.slug.trim().toLowerCase();
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug)) throw new Error("Project slug must be kebab-case.");
+    if (!input.name.trim()) throw new Error("Project name is required.");
+    if (this.store.projects.some((project) => project.slug === slug)) throw new Error(`Project slug '${slug}' already exists.`);
+    const now = this.clock().toISOString();
+    return { id: randomUUID(), slug, name: input.name.trim(), description: input.description?.trim(), status: "active", createdAt: now, updatedAt: now };
+  }
+
+  private newSource(projectId: string, input: CreateSourceInput): ProjectSource {
+    if (!input.provider.trim()) throw new Error("Source provider is required.");
+    if (input.config.readOnly === false) throw new Error("Observed-project sources must be configured read-only.");
+    const config = { ...structuredClone(input.config), readOnly: true };
+    return { id: randomUUID(), projectId, type: input.type, provider: input.provider.trim().toLowerCase(), config, encryptedConfig: this.cipher.encrypt(config), enabled: input.enabled ?? true };
   }
 
   private audit(action: string, metadata: Record<string, unknown>, projectId?: string, actorId?: string): void {
