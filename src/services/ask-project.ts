@@ -72,7 +72,8 @@ interface Candidate {
   score: number;
   matchedTerms: string[];
   primaryMatches: string[];
-  line?: { startLine: number; endLine: number; excerpt: string };
+  primaryLineMatches: number;
+  line?: { startLine: number; endLine: number; excerpt: string; primaryMatchCount: number };
 }
 
 const MAX_QUESTION_LENGTH = 2_000;
@@ -163,7 +164,7 @@ export class AskProjectService {
       }
     }
 
-    return candidates.filter((candidate) => candidate.score > 0 && (topical.length === 0 || candidate.matchedTerms.some((term) => topical.includes(term))) && (primary.length === 0 || candidate.primaryMatches.length > 0));
+    return candidates.filter((candidate) => candidate.score > 0 && (topical.length === 0 || candidate.matchedTerms.some((term) => topical.includes(term))) && (primary.length === 0 || candidate.primaryMatches.length > 0) && (primary.length < 2 || candidate.primaryLineMatches >= 2));
   }
 
   private candidateFor(projectId: string, item: KnowledgeItem | undefined, provenance: Provenance | undefined, artifact: SourceArtifact | undefined, current: boolean, terms: string[], primary: string[], intent: QuestionIntent): Candidate {
@@ -189,6 +190,7 @@ export class AskProjectService {
       score,
       matchedTerms: match.terms,
       primaryMatches: match.primary,
+      primaryLineMatches: line?.primaryMatchCount ?? 0,
       line: line ?? provenanceLine,
     };
   }
@@ -329,7 +331,7 @@ function occurrences(text: string, term: string): number {
 }
 function containsTerm(text: string, term: string): boolean { return occurrences(text, term) > 0; }
 function escapeRegExp(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-function normalizeSearch(value: string): string { return value.replace(/([a-z\d])([A-Z])/g, "$1 $2").replace(/[^\p{L}\p{N}]+/gu, " ").split(/\s+/).filter(Boolean).map(canonicalTerm).join(" "); }
+function normalizeSearch(value: string): string { return value.replace(/([a-z\d])([A-Z])/g, "$1 $2").replace(/[^\p{L}\p{N}]+/gu, " ").toLocaleLowerCase().split(/\s+/).filter(Boolean).map(canonicalTerm).join(" "); }
 function adjacentPhrases(terms: string[]): string[] { return terms.flatMap((term, index) => index + 1 < terms.length ? [`${term} ${terms[index + 1]}`] : []); }
 
 function evidenceRole(path: string | undefined, item: KnowledgeItem | undefined): EvidenceRole {
@@ -357,21 +359,22 @@ function intentWeight(intent: QuestionIntent, role: EvidenceRole): number {
   return weights[intent][role] ?? 0;
 }
 
-function locateLine(content: string, terms: string[], primary: string[]): { startLine: number; endLine: number; excerpt: string } | undefined {
+function locateLine(content: string, terms: string[], primary: string[]): { startLine: number; endLine: number; excerpt: string; primaryMatchCount: number } | undefined {
   const lines = safeText(content).replace(/\r/g, "").split("\n");
-  let best: { index: number; hits: number } | undefined;
+  let best: { index: number; hits: number; primaryMatchCount: number } | undefined;
   for (const [index, line] of lines.entries()) {
     const normalized = normalizeSearch(line);
+    const primaryMatchCount = primary.filter((term) => containsTerm(normalized, term)).length;
     const hits = terms.reduce((total, term) => total + (containsTerm(normalized, term) ? primary.includes(term) ? 5 : 1 : 0), 0) + adjacentPhrases(primary).filter((phrase) => normalized.includes(phrase)).length * 10;
-    if (!best || hits > best.hits) best = { index, hits };
+    if (!best || hits > best.hits) best = { index, hits, primaryMatchCount };
   }
   if (!best || best.hits === 0) return undefined;
-  return { startLine: best.index + 1, endLine: best.index + 1, excerpt: compactExcerpt(lines[best.index] ?? "") };
+  return { startLine: best.index + 1, endLine: best.index + 1, excerpt: compactExcerpt(lines[best.index] ?? ""), primaryMatchCount: best.primaryMatchCount };
 }
 
-function validRange(provenance: Provenance | undefined): { startLine: number; endLine: number; excerpt: string } | undefined {
+function validRange(provenance: Provenance | undefined): { startLine: number; endLine: number; excerpt: string; primaryMatchCount: number } | undefined {
   if (!provenance?.startLine || !provenance.endLine || provenance.startLine < 1 || provenance.endLine < provenance.startLine) return undefined;
-  return { startLine: provenance.startLine, endLine: provenance.endLine, excerpt: "" };
+  return { startLine: provenance.startLine, endLine: provenance.endLine, excerpt: "", primaryMatchCount: 0 };
 }
 
 function selectEvidence(candidates: Candidate[], intent: QuestionIntent): AnswerEvidence[] {
