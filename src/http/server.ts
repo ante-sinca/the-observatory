@@ -4,6 +4,7 @@ import { ConfigCipher, sha256 } from "../core/security.js";
 import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
 import { ProjectRegistry } from "../services/project-registry.js";
 import { ProjectQueryService } from "../services/query.js";
+import { AskProjectService } from "../services/ask-project.js";
 import { ObservatoryToolService } from "../mcp/tools.js";
 import type { ProjectSource, SourceConfig, SourceType } from "../domain/types.js";
 
@@ -11,6 +12,7 @@ export interface ObservatoryHttpServices {
   registry: ProjectRegistry;
   refresh: RefreshOrchestrator;
   queries: ProjectQueryService;
+  ask: AskProjectService;
   tools: ObservatoryToolService;
 }
 
@@ -26,7 +28,7 @@ export async function handleHttpRequest(request: IncomingMessage, response: Serv
     await route(request, response, services);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unexpected server error.";
-    const status = /not found/i.test(message) ? 404 : /must|required|already exists|unsupported/i.test(message) ? 400 : 500;
+    const status = /not found/i.test(message) ? 404 : /must|required|already exists|unsupported|too large/i.test(message) ? 400 : 500;
     if (isBrowserPageRequest(request)) return sendHtml(response, browserNotFound(message), status);
     send(response, status, { error: message });
   }
@@ -67,7 +69,7 @@ async function route(request: IncomingMessage, response: ServerResponse, service
     const body = await jsonBody(request);
     if (typeof body.name !== "string") throw new Error("'name' is required.");
     const input = isRecord(body.arguments) ? body.arguments : {};
-    return send(response, 200, { result: services.tools.call(body.name, input) });
+    return send(response, 200, { result: await services.tools.call(body.name, input) });
   }
   if (path === "/api/projects" && method === "GET") return send(response, 200, services.queries.listProjects());
   if (path === "/api/projects" && method === "POST") {
@@ -89,6 +91,10 @@ async function route(request: IncomingMessage, response: ServerResponse, service
   }
   const projectId = services.queries.getProject(projectRef).id;
   const resource = segments[3];
+  if (resource === "ask" && method === "POST" && segments.length === 4) {
+    const body = await jsonBody(request, 12_000);
+    return send(response, 200, await services.ask.ask(projectId, stringField(body, "question")));
+  }
   if (resource === "sources" && method === "GET" && segments.length === 4) return send(response, 200, services.registry.getSources(projectId).map(publicSource));
   if (resource === "sources" && method === "POST" && segments.length === 4) {
     assertOperator(request);
@@ -335,7 +341,7 @@ function optionalStringField(value: Record<string, unknown>, key: string): strin
 function optionalBooleanField(value: Record<string, unknown>, key: string): boolean | undefined { const field = value[key]; if (field === undefined) return undefined; if (typeof field !== "boolean") throw new Error(`'${key}' must be a boolean.`); return field; }
 function recordField(value: Record<string, unknown>, key: string): Record<string, unknown> { const field = value[key]; if (!isRecord(field)) throw new Error(`'${key}' must be an object.`); return field; }
 function numberQuery(url: URL, key: string): number | undefined { const value = url.searchParams.get(key); if (value === null) return undefined; const parsed = Number(value); if (!Number.isInteger(parsed)) throw new Error(`'${key}' must be an integer.`); return parsed; }
-async function jsonBody(request: IncomingMessage): Promise<Record<string, unknown>> { const chunks: Buffer[] = []; for await (const chunk of request) { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); } if (chunks.length === 0) return {}; const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8")); if (!isRecord(parsed)) throw new Error("Request body must be a JSON object."); return parsed; }
+async function jsonBody(request: IncomingMessage, maxBytes = 1_000_000): Promise<Record<string, unknown>> { const chunks: Buffer[] = []; let size = 0; for await (const chunk of request) { const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk); size += part.length; if (size > maxBytes) throw new Error("Request body is too large."); chunks.push(part); } if (chunks.length === 0) return {}; const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8")); if (!isRecord(parsed)) throw new Error("Request body must be a JSON object."); return parsed; }
 function send(response: ServerResponse, status: number, data: unknown): void { response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }); response.end(JSON.stringify(data)); }
 function sendHtml(response: ServerResponse, html: string, status = 200, headers: Record<string, string | string[]> = {}): void { response.writeHead(status, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", ...headers }); response.end(html); }
 function sendRedirect(response: ServerResponse, location: string, cookies: string[] = []): void { response.writeHead(303, { location, "cache-control": "no-store", ...(cookies.length ? { "set-cookie": cookies } : {}) }); response.end(); }
@@ -348,7 +354,7 @@ function projectScreen(services: ObservatoryHttpServices, projectRef: string, pa
   const state = services.queries.getProjectState(projectRef);
   const project = state.project;
   const base = `/projects/${encodeURIComponent(project.slug)}`;
-  const nav = ["overview", "state", "knowledge", "movements", "sources"].map((item) => `<a class="${page === item ? "active" : ""}" href="${base}${item === "overview" ? "" : `/${item}`}">${item.replace(/^./, (char) => char.toUpperCase())}</a>`).join("");
+  const nav = ["overview", "state", "knowledge", "movements", "sources", "ask"].map((item) => `<a class="${page === item ? "active" : ""}" href="${base}${item === "overview" ? "" : `/${item}`}">${item.replace(/^./, (char) => char.toUpperCase())}</a>`).join("");
   let content: string;
   switch (page) {
     case "overview": content = `${onboardingComplete ? onboardingSuccess(services.queries.getOnboardingSummary(project.id), project.name) : ""}<h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.description ?? "No project description.")}</p><section><h2>Current snapshot</h2><dl><dt>Repository head</dt><dd>${escapeHtml(state.snapshot?.repositoryRevision ?? "Unknown")}</dd><dt>Production deployment</dt><dd>${escapeHtml(state.snapshot?.deploymentRevision ?? "Unknown")}</dd><dt>Knowledge items</dt><dd>${state.summary?.knowledgeCount ?? 0}</dd><dt>Resolution</dt><dd>${escapeHtml(state.summary?.resolution ?? "No snapshot")}</dd></dl></section><section><h2>Unresolved conflicts</h2>${list(state.unresolvedConflicts.map((conflict) => `${conflict.severity}: ${conflict.title}`))}</section><section><h2>Recent movements</h2>${list(state.latestMovements.slice(0, 8).map((movement) => `${movement.movementType}: ${movement.entityKey}`))}</section>`; break;
@@ -356,9 +362,42 @@ function projectScreen(services: ObservatoryHttpServices, projectRef: string, pa
     case "knowledge": content = `<h1>Knowledge</h1>${list(services.queries.getKnowledge(project.id).map((record) => `${record.item.type}: ${record.item.title} — ${record.provenance.map((provenance) => provenance.path ?? provenance.sourceRef).join(", ")}`))}`; break;
     case "movements": content = `<h1>Movements</h1>${list(services.queries.getRecentChanges(project.id).map((movement) => `${movement.createdAt}: ${movement.movementType} ${movement.entityKey}`))}`; break;
     case "sources": content = sourcesScreen(project.slug, services.registry.getSources(project.id), csrf, canOperate); break;
+    case "ask": content = askScreen(project.slug, project.name, services.queries.listProjects()); break;
     default: throw new Error("Browser page not found.");
   }
   return layout(`${project.name} — Project Observatory`, `<nav class="project-nav">${nav}</nav>${content}`);
+}
+
+function askScreen(slug: string, name: string, projects: ReturnType<ProjectQueryService["listProjects"]>): string {
+  const options = projects.map((project) => `<option value="${escapeHtml(project.slug)}"${project.slug === slug ? " selected" : ""}>${escapeHtml(project.name)}</option>`).join("");
+  const suggestions = ["Where is this value configured?", "How does this feature work?", "Which tests cover this behaviour?", "Where would I change this safely?", "What changed recently in this area?"];
+  return `<h1>Ask ${escapeHtml(name)}</h1><p class="project-label">Project: <strong>${escapeHtml(name)}</strong></p><label for="ask-project">Project selector<select id="ask-project" aria-label="Project selector">${options}</select></label><form id="ask-form"><label for="ask-question">Ask a question about ${escapeHtml(name)}<textarea id="ask-question" name="question" maxlength="2000" required placeholder="Where is this value configured?"></textarea></label><button type="submit">Ask</button></form><section class="wide"><h2>Suggested questions</h2><p>${suggestions.map((suggestion) => `<button class="suggestion" type="button" data-question="${escapeHtml(suggestion)}">${escapeHtml(suggestion)}</button>`).join("")}</p></section><section id="ask-result" class="wide" aria-live="polite"><p class="muted">Answers are grounded only in this project’s current indexed snapshot.</p></section><script>
+(() => {
+  const slug=${JSON.stringify(slug)};
+  const form=document.querySelector('#ask-form');
+  const input=document.querySelector('#ask-question');
+  const output=document.querySelector('#ask-result');
+  const selector=document.querySelector('#ask-project');
+  selector.addEventListener('change', () => { window.location.assign('/projects/' + encodeURIComponent(selector.value) + '/ask'); });
+  document.querySelectorAll('[data-question]').forEach((button) => button.addEventListener('click', () => { input.value=button.dataset.question || ''; input.focus(); }));
+  const add=(parent, tag, value, className) => { const element=document.createElement(tag); if(className) element.className=className; element.textContent=value; parent.appendChild(element); return element; };
+  const lineLabel=(e) => e.startLine ? 'lines ' + e.startLine + (e.endLine && e.endLine !== e.startLine ? '–' + e.endLine : '') : 'line unavailable';
+  const render=(data) => {
+    output.replaceChildren();
+    add(output,'h2','Answer');
+    add(output,'p','Status: ' + data.status);
+    add(output,'p','Repository revision: ' + (data.repositoryRevision || 'Unavailable'));
+    add(output,'p',data.answer);
+    add(output,'h2','Evidence');
+    if (!data.evidence.length) add(output,'p','No matching current evidence was returned.');
+    const evidence=document.createElement('ul');
+    data.evidence.forEach((item) => { const row=document.createElement('li'); add(row,'strong',item.role.replaceAll('_',' ')); add(row,'div',item.path || 'Path unavailable'); add(row,'div',lineLabel(item),'muted'); add(row,'div','Reason: ' + item.reason); evidence.appendChild(row); });
+    output.appendChild(evidence);
+    if (data.conflicts && data.conflicts.length) { add(output,'h2','Conflicts'); const conflicts=document.createElement('ul'); data.conflicts.forEach((item) => { const row=document.createElement('li'); add(row,'strong',item.title); add(row,'div',item.description); conflicts.appendChild(row); }); output.appendChild(conflicts); }
+  };
+  form.addEventListener('submit', async (event) => { event.preventDefault(); output.replaceChildren(); add(output,'p','Checking the current indexed evidence…','muted'); try { const response=await fetch('/api/projects/' + encodeURIComponent(slug) + '/ask',{method:'POST',headers:{'content-type':'application/json','accept':'application/json'},body:JSON.stringify({question:input.value})}); const data=await response.json(); if(!response.ok) throw new Error(data.error || 'Ask request failed.'); render(data); } catch(error) { output.replaceChildren(); add(output,'p',error instanceof Error ? error.message : 'Ask request failed.','notice error'); } });
+})();
+</script>`;
 }
 
 function operatorSignIn(csrf: string, message?: string): string { return layout("Operator sign-in — Project Observatory", `<h1>Operator authorization required</h1><p>Enter the existing Observatory operator token to start a short-lived, same-site session for project onboarding.</p>${message ? `<p class="notice error">${escapeHtml(message)}</p>` : ""}<form method="post" action="/projects/new/auth"><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"><label>Operator token<input name="operatorToken" type="password" required autocomplete="current-password"></label><button type="submit">Authorize onboarding</button></form>`); }
@@ -385,5 +424,5 @@ function sourcesScreen(slug: string, sources: ProjectSource[], csrf: string, can
 
 function list(values: string[]): string { return values.length ? `<ul>${values.map((value) => `<li>${escapeHtml(value)}</li>`).join("")}</ul>` : "<p>None.</p>"; }
 function json(value: unknown): string { return `<pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre>`; }
-function layout(title: string, content: string): string { return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font:16px system-ui;max-width:960px;margin:3rem auto;padding:0 1rem;background:#08111b;color:#e8f0f7}article,section,fieldset{display:inline-block;vertical-align:top;width:260px;min-height:150px;margin:0 1rem 1rem 0;padding:1.25rem;background:#122232;border:1px solid #28465e;border-radius:12px;box-sizing:border-box}section{width:calc(50% - 3rem)}section.wide{width:100%}h1{font-size:2rem}h2{margin-top:0}dt{color:#9eb6ca}dd{margin:0 0 .7rem}code,a{color:#7cdbff}a{font-weight:600}.button,button{display:inline-block;border:0;border-radius:6px;padding:.55rem .8rem;background:#1d6888;color:#fff;font:inherit;font-weight:700;cursor:pointer;text-decoration:none;margin:.35rem .35rem .35rem 0}.site-nav,.project-nav{display:flex;gap:1rem;margin:1.25rem 0}.site-nav{margin-top:0;padding-bottom:1rem;border-bottom:1px solid #28465e}.project-nav .active{color:#fff;text-decoration-thickness:3px}form{margin:.75rem 0}label{display:block;margin:.7rem 0;font-weight:600}input,textarea{box-sizing:border-box;display:block;width:100%;margin-top:.25rem;padding:.55rem;border:1px solid #517089;border-radius:6px;background:#07131f;color:#e8f0f7;font:inherit}textarea{min-height:5rem}.notice{padding:1rem;border-radius:8px}.notice.success{background:#113c2e;border:1px solid #277653}.notice.error{background:#481f29;border:1px solid #a14055}.muted{color:#9eb6ca}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#122232;padding:1rem;border-radius:8px}li{margin:.5rem 0}@media(max-width:640px){section,article,fieldset{width:100%;margin-right:0}.site-nav,.project-nav{flex-wrap:wrap}}</style><nav class="site-nav" aria-label="Primary"><a href="/">Home</a><a href="/projects">Projects</a></nav>${content}</html>`; }
+function layout(title: string, content: string): string { return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font:16px system-ui;max-width:960px;margin:3rem auto;padding:0 1rem;background:#08111b;color:#e8f0f7}article,section,fieldset{display:inline-block;vertical-align:top;width:260px;min-height:150px;margin:0 1rem 1rem 0;padding:1.25rem;background:#122232;border:1px solid #28465e;border-radius:12px;box-sizing:border-box}section{width:calc(50% - 3rem)}section.wide{width:100%}h1{font-size:2rem}h2{margin-top:0}dt{color:#9eb6ca}dd{margin:0 0 .7rem}code,a{color:#7cdbff}a{font-weight:600}.button,button{display:inline-block;border:0;border-radius:6px;padding:.55rem .8rem;background:#1d6888;color:#fff;font:inherit;font-weight:700;cursor:pointer;text-decoration:none;margin:.35rem .35rem .35rem 0}.site-nav,.project-nav{display:flex;gap:1rem;margin:1.25rem 0}.site-nav{margin-top:0;padding-bottom:1rem;border-bottom:1px solid #28465e}.project-nav .active{color:#fff;text-decoration-thickness:3px}form{margin:.75rem 0}label{display:block;margin:.7rem 0;font-weight:600}input,textarea,select{box-sizing:border-box;display:block;width:100%;margin-top:.25rem;padding:.55rem;border:1px solid #517089;border-radius:6px;background:#07131f;color:#e8f0f7;font:inherit}textarea{min-height:5rem}.notice{padding:1rem;border-radius:8px}.notice.success{background:#113c2e;border:1px solid #277653}.notice.error{background:#481f29;border:1px solid #a14055}.muted{color:#9eb6ca}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#122232;padding:1rem;border-radius:8px}li{margin:.5rem 0}@media(max-width:640px){section,article,fieldset{width:100%;margin-right:0}.site-nav,.project-nav{flex-wrap:wrap}}</style><nav class="site-nav" aria-label="Primary"><a href="/">Home</a><a href="/projects">Projects</a></nav>${content}</html>`; }
 function escapeHtml(value: string): string { return value.replace(/[&<>\"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character] ?? character); }

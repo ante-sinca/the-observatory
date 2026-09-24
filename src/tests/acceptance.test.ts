@@ -11,6 +11,7 @@ import { createVercelHandler, restoreVercelRequestUrl } from "../http/vercel.js"
 import { createObservatory } from "../index.js";
 import { ProjectRegistry } from "../services/project-registry.js";
 import { ProjectQueryService } from "../services/query.js";
+import { AskProjectService } from "../services/ask-project.js";
 import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
 
 class RepositoryFixture implements SourceAdapter {
@@ -42,7 +43,8 @@ function setup() {
   const adapters = new AdapterRegistry().registerRepository(repository).registerRepository(github).registerDeployment(new FailingDeploymentFixture());
   const refresh = new RefreshOrchestrator(store, adapters, () => new Date("2026-09-23T00:00:00.000Z"));
   const queries = new ProjectQueryService(store);
-  return { store, registry, repository, github, refresh, queries, tools: new ObservatoryToolService(queries) };
+  const ask = new AskProjectService(store, queries);
+  return { store, registry, repository, github, refresh, queries, ask, tools: new ObservatoryToolService(queries, ask) };
 }
 
 function cookieHeader(response: Response): string {
@@ -179,14 +181,14 @@ test("MCP registry contains only documented read-only tools and delegates querie
   await registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
   await refresh.refresh(project.id);
   const names = tools.listTools().map((tool) => tool.name);
-  assert.deepEqual(names, ["list_projects", "get_project_state", "search_project", "get_recent_changes", "get_deployments", "get_decisions", "get_known_risks", "get_knowledge_item", "compare_snapshots", "get_source_artifact"]);
+  assert.deepEqual(names, ["list_projects", "get_project_state", "search_project", "get_recent_changes", "get_deployments", "get_decisions", "get_known_risks", "get_knowledge_item", "compare_snapshots", "get_source_artifact", "ask_project"]);
   assert.equal((tools.call("search_project", { project: project.id, query: "evidence" }) as unknown[]).length, 1);
   assert.equal(names.some((name) => ["edit_file", "commit", "merge", "deploy", "execute_sql", "send_payment", "mutate_production"].includes(name)), false);
 });
 
 test("HTTP project administration and read-only MCP discovery use the shared services", async () => {
-  const { registry, refresh, queries, tools } = setup();
-  const server = createHttpServer({ registry, refresh, queries, tools });
+  const { registry, refresh, queries, ask, tools } = setup();
+  const server = createHttpServer({ registry, refresh, queries, ask, tools });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   try {
@@ -202,10 +204,10 @@ test("HTTP project administration and read-only MCP discovery use the shared ser
 });
 
 test("browser navigation renders the dashboard and projects index from shared project queries", async () => {
-  const { registry, refresh, queries, tools } = setup();
+  const { registry, refresh, queries, ask, tools } = setup();
   await registry.createProject({ slug: "homebound", name: "HomeBound" });
   await registry.createProject({ slug: "homegift", name: "HomeGift" });
-  const server = createHttpServer({ registry, refresh, queries, tools });
+  const server = createHttpServer({ registry, refresh, queries, ask, tools });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   try {
@@ -271,9 +273,9 @@ test("guided GitHub onboarding validates before persistence and never renders cr
   const operatorToken = "operator-token-for-test";
   const providerToken = "github-token-must-never-appear";
   process.env.OBSERVATORY_OPERATOR_TOKEN = operatorToken;
-  const { store, registry, github, refresh, queries, tools } = setup();
+  const { store, registry, github, refresh, queries, ask, tools } = setup();
   github.files.set("README.md", "# New project\nEvidence from GitHub.");
-  const server = createHttpServer({ registry, refresh, queries, tools });
+  const server = createHttpServer({ registry, refresh, queries, ask, tools });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   const origin = `http://127.0.0.1:${port}`;
@@ -382,10 +384,10 @@ test("failed first onboarding refresh preserves a retryable project and source",
   const previousOperatorToken = process.env.OBSERVATORY_OPERATOR_TOKEN;
   const operatorToken = "operator-token-for-retry-test";
   process.env.OBSERVATORY_OPERATOR_TOKEN = operatorToken;
-  const { store, registry, github, refresh, queries, tools } = setup();
+  const { store, registry, github, refresh, queries, ask, tools } = setup();
   github.files.set("README.md", "# Retry project\nEvidence.");
   github.failArtifactListing = true;
-  const server = createHttpServer({ registry, refresh, queries, tools });
+  const server = createHttpServer({ registry, refresh, queries, ask, tools });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   const origin = `http://127.0.0.1:${port}`;

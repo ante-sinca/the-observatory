@@ -10,6 +10,7 @@ import { ObservatoryToolService } from "../mcp/tools.js";
 import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
 import { ProjectRegistry } from "../services/project-registry.js";
 import { ProjectQueryService } from "../services/query.js";
+import { AskProjectService } from "../services/ask-project.js";
 import { runMigrations } from "../core/migrations.js";
 import type { ArtifactContent, DeploymentAdapter, DeploymentRecord, HealthResult, RefreshRun, Snapshot, SourceAdapter, SourceArtifact, SourceArtifactRef, SourceConfig, SourceRevision } from "../domain/types.js";
 
@@ -149,8 +150,9 @@ test("PostgreSQL durable-store release gates", { skip: connectionString ? false 
   // HTTP and HTTP MCP read that same newly hydrated service state.
   const secondRegistry = new ProjectRegistry(second, cipher);
   const secondRefresh = new RefreshOrchestrator(second, adapters);
-  const tools = new ObservatoryToolService(secondQueries);
-  const server = createHttpServer({ registry: secondRegistry, refresh: secondRefresh, queries: secondQueries, tools });
+  const ask = new AskProjectService(second, secondQueries);
+  const tools = new ObservatoryToolService(secondQueries, ask);
+  const server = createHttpServer({ registry: secondRegistry, refresh: secondRefresh, queries: secondQueries, ask, tools });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const port = (server.address() as AddressInfo).port;

@@ -38,6 +38,15 @@ GET /api/projects/:projectId/search?q=...
 ### Deployments
 GET /api/projects/:projectId/deployments
 
+### Ask Project
+POST /api/projects/:projectId/ask
+
+Accepts `{ "question": "..." }` and returns a project-scoped, evidence-backed
+answer using the latest durable snapshot. Responses include an explicit status,
+repository revision, ranked provenance, and any relevant unresolved conflicts.
+Ask is read-only, bounded to 2,000 question characters, and uses
+`Cache-Control: no-store`.
+
 ## AI/MCP tools
 
 ### list_projects
@@ -106,6 +115,15 @@ Input:
 - artifact_id
 
 Returns safe indexed content only. Secret/private excluded artifacts must never be returned.
+
+### ask_project
+Input:
+- project
+- question
+
+Returns the same stable answer contract as `POST /api/projects/:projectId/ask`.
+It is backed by `AskProjectService`, so browser and MCP retrieval, ranking,
+grounding, conflict handling, and project isolation are identical.
 
 ## Explicitly absent from v0.1
 

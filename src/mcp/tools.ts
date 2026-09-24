@@ -1,4 +1,5 @@
 import type { KnowledgeType } from "../domain/types.js";
+import { AskProjectService } from "../services/ask-project.js";
 import { ProjectQueryService } from "../services/query.js";
 
 export interface McpToolDefinition {
@@ -14,7 +15,7 @@ const projectParameter = { type: "string", description: "Project ID or slug." };
  * observed-system write capability. Project administration remains HTTP-only.
  */
 export class ObservatoryToolService {
-  constructor(private readonly queries: ProjectQueryService) {}
+  constructor(private readonly queries: ProjectQueryService, private readonly askProject?: AskProjectService) {}
 
   listTools(): McpToolDefinition[] {
     return [
@@ -28,6 +29,7 @@ export class ObservatoryToolService {
       definition("get_knowledge_item", "Get a knowledge item and its provenance.", { project: projectParameter, item_id: { type: "string" } }, ["project", "item_id"]),
       definition("compare_snapshots", "Get recorded movements between two snapshots.", { project: projectParameter, from_snapshot: { type: "string" }, to_snapshot: { type: "string" } }, ["project", "from_snapshot", "to_snapshot"]),
       definition("get_source_artifact", "Get safe indexed artifact text only; excluded artifacts cannot be returned.", { project: projectParameter, artifact_id: { type: "string" } }, ["project", "artifact_id"]),
+      definition("ask_project", "Ask an evidence-backed question about one project's current observed snapshot.", { project: projectParameter, question: { type: "string", minLength: 1, maxLength: 2000 } }, ["project", "question"]),
     ];
   }
 
@@ -43,6 +45,10 @@ export class ObservatoryToolService {
       case "get_knowledge_item": return this.queries.getKnowledge(requiredString(input, "project"), requiredString(input, "item_id"));
       case "compare_snapshots": return this.queries.compareSnapshots(requiredString(input, "project"), requiredString(input, "from_snapshot"), requiredString(input, "to_snapshot"));
       case "get_source_artifact": return this.queries.getSourceArtifact(requiredString(input, "project"), requiredString(input, "artifact_id"));
+      case "ask_project": {
+        if (!this.askProject) throw new Error("Ask Project is not configured.");
+        return this.askProject.ask(requiredString(input, "project"), requiredString(input, "question"));
+      }
       default: throw new Error(`Unknown or unsupported read-only tool '${name}'.`);
     }
   }

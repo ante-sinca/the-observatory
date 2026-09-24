@@ -9,6 +9,7 @@ import { runMcpStdioServer } from "./mcp/server.js";
 import { ObservatoryToolService } from "./mcp/tools.js";
 import { ProjectRegistry } from "./services/project-registry.js";
 import { ProjectQueryService } from "./services/query.js";
+import { AskProjectService } from "./services/ask-project.js";
 import { AdapterRegistry, RefreshOrchestrator } from "./services/refresh.js";
 
 export async function createObservatory(options: { store?: ObservatoryStore } = {}) {
@@ -19,8 +20,9 @@ export async function createObservatory(options: { store?: ObservatoryStore } = 
   const registry = new ProjectRegistry(store, cipher);
   const refresh = new RefreshOrchestrator(store, adapters);
   const queries = new ProjectQueryService(store);
-  const tools = new ObservatoryToolService(queries);
-  return { store, adapters, registry, refresh, queries, tools };
+  const ask = new AskProjectService(store, queries);
+  const tools = new ObservatoryToolService(queries, ask);
+  return { store, adapters, registry, refresh, queries, ask, tools };
 }
 
 if (process.argv[1] && new URL(`file://${process.argv[1].replaceAll("\\", "/")}`).href === import.meta.url) {
