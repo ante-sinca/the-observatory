@@ -44,9 +44,23 @@ node dist/index.js --mcp
 `POSTGRES_URL` is the provider-managed pooled Vercel/Neon runtime variable.
 `POSTGRES_URL_NON_POOLING` is reserved for the guarded migration runner. Source configurations are encrypted before they are persisted; they
 are decrypted only while building the registered read-only adapter. The
-PostgreSQL store hydrates all canonical state at process start, and both HTTP
-and HTTP MCP use the same services over that store. `api/index.ts` is a thin
-Vercel function adapter; the stdio MCP process remains a local/server runtime.
+PostgreSQL store hydrates all canonical state at process start, and browser,
+HTTP, and MCP use the same query and `AskProjectService` layer over that store.
+`api/index.ts` is a thin Vercel function adapter; the stdio MCP process remains
+a local/server runtime.
+
+### Secure remote MCP / ChatGPT
+
+The production MCP endpoint is `POST /mcp` over public HTTPS. It accepts
+authenticated JSON-RPC 2.0 MCP requests and exposes only seven bounded
+read-only tools. Set a dedicated `OBSERVATORY_MCP_READ_TOKEN` in Vercel; it is
+not an operator credential and cannot administer projects or refresh sources.
+In production, `/mcp` fails closed unless the request is HTTPS and carries the
+matching bearer value. It emits `Cache-Control: no-store`, redacts returned
+text, and records minimal `mcp.read` audit events without questions, queries,
+or tokens.
+
+Use the detailed [remote MCP contract and ChatGPT connection steps](API_AND_MCP.md).
 
 Migrations are ordered, checksummed, transactionally ledgered in
 `observatory_schema_migrations`, and never reset or drop data automatically.

@@ -175,15 +175,20 @@ test("explicit contradictory documentation and implementation evidence creates a
 });
 
 test("MCP registry contains only documented read-only tools and delegates queries", async () => {
-  const { registry, refresh, repository, tools } = setup();
+  const { registry, refresh, repository, tools, queries, ask } = setup();
   repository.files.set("README.md", "# Read only\nEvidence.");
   const project = await registry.createProject({ slug: "tools", name: "Tools" });
   await registry.addSource(project.id, { type: "repository", provider: "fixture", config: {} });
   await refresh.refresh(project.id);
   const names = tools.listTools().map((tool) => tool.name);
-  assert.deepEqual(names, ["list_projects", "get_project_state", "search_project", "get_recent_changes", "get_deployments", "get_decisions", "get_known_risks", "get_knowledge_item", "compare_snapshots", "get_source_artifact", "ask_project"]);
-  assert.equal((tools.call("search_project", { project: project.id, query: "evidence" }) as unknown[]).length, 1);
+  assert.deepEqual(names, ["list_projects", "get_project_state", "search_project", "get_evidence", "get_file_excerpt", "get_recent_movements", "ask_project"]);
+  assert.equal((tools.call("search_project", { project: project.id, query: "evidence" }) as { results: unknown[] }).results.length, 1);
+  assert.equal(tools.listTools().every((tool) => tool.annotations.readOnlyHint && !tool.annotations.destructiveHint), true);
   assert.equal(names.some((name) => ["edit_file", "commit", "merge", "deploy", "execute_sql", "send_payment", "mutate_production"].includes(name)), false);
+
+  const localTools = new ObservatoryToolService(queries, ask, "local");
+  assert.deepEqual(localTools.listTools().map((tool) => tool.name), ["list_projects", "get_project_state", "search_project", "get_recent_changes", "get_deployments", "get_decisions", "get_known_risks", "get_knowledge_item", "compare_snapshots", "get_source_artifact", "ask_project"]);
+  assert.equal((localTools.call("search_project", { project: project.id, query: "evidence" }) as unknown[]).length, 1);
 });
 
 test("HTTP project administration and read-only MCP discovery use the shared services", async () => {
@@ -196,8 +201,9 @@ test("HTTP project administration and read-only MCP discovery use the shared ser
     assert.equal(created.status, 201);
     const projects = await (await fetch(`http://127.0.0.1:${port}/api/projects`)).json() as Array<{ slug: string }>;
     assert.deepEqual(projects.map((project) => project.slug), ["http-project"]);
-    const toolCatalog = await (await fetch(`http://127.0.0.1:${port}/mcp/tools`)).json() as { tools: Array<{ name: string }> };
-    assert.ok(toolCatalog.tools.some((tool) => tool.name === "get_project_state"));
+    const toolCatalog = await fetch(`http://127.0.0.1:${port}/mcp/tools`);
+    assert.equal(toolCatalog.status, 401);
+    assert.equal((await toolCatalog.json() as { error: { code: string } }).error.code, "unauthorized");
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }

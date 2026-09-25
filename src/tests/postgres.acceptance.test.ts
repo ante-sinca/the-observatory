@@ -159,7 +159,7 @@ test("PostgreSQL durable-store release gates", { skip: connectionString ? false 
     const state = await fetch(`http://127.0.0.1:${port}/api/projects/${project.slug}`).then(async (response) => ({ status: response.status, value: await response.json() }));
     assert.equal(state.status, 200);
     assert.equal((state.value as { snapshot?: { id?: string } }).snapshot?.id, initial.snapshot?.id);
-    assert.equal((tools.call("search_project", { project: project.id, query: "evidence" }) as unknown[]).length, 1);
+    assert.equal((tools.call("search_project", { project: project.id, query: "evidence" }) as { results: unknown[] }).results.length, 1);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }

@@ -156,8 +156,8 @@ test("Ask browser page and API enforce the stable, bounded read-only contract", 
     assert.equal((await api.json() as { project: string; evidence: unknown[] }).project, "homegift");
 
     const mcp = await fetch(`${origin}/mcp/call`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "ask_project", arguments: { project: "homegift", question: "Where are donation amount presets defined?" } }) });
-    assert.equal(mcp.status, 200);
-    assert.equal((await mcp.json() as { result: { project: string } }).result.project, "homegift");
+    assert.equal(mcp.status, 401);
+    assert.equal((await mcp.json() as { error: { code: string } }).error.code, "unauthorized");
 
     const empty = await fetch(`${origin}/api/projects/homegift/ask`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: "  " }) });
     assert.equal(empty.status, 400);

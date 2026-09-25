@@ -176,6 +176,30 @@ export class ProjectQueryService {
     return { id: artifact.id, path: artifact.path, revision: artifact.revision, contentHash: artifact.contentHash, content: artifact.content, metadata: artifact.metadata };
   }
 
+  /** Returns only ownership state; it deliberately exposes no artifact fields. */
+  sourceArtifactScope(projectRef: string, artifactId: string): "in_project" | "other_project" | "missing" {
+    const project = this.getProject(projectRef);
+    const artifact = this.store.artifacts.find((candidate) => candidate.id === artifactId);
+    if (!artifact) return "missing";
+    return artifact.projectId === project.id ? "in_project" : "other_project";
+  }
+
+  /**
+   * Resolves only an exactly observed, current-revision repository path. The
+   * caller is responsible for path syntax validation; this method performs no
+   * normalization so a near-match can never escape the project's snapshot.
+   */
+  getCurrentSourceArtifactByPath(projectRef: string, path: string): Pick<import("../domain/types.js").SourceArtifact, "id" | "path" | "revision" | "contentHash" | "content"> | undefined {
+    const project = this.getProject(projectRef);
+    const revision = this.latestSnapshot(project.id)?.repositoryRevision;
+    if (!revision) return undefined;
+    const artifact = this.store.artifacts.find((candidate) => candidate.projectId === project.id
+      && candidate.path === path
+      && candidate.content !== undefined
+      && candidate.revision === revision);
+    return artifact ? { id: artifact.id, path: artifact.path, revision: artifact.revision, contentHash: artifact.contentHash, content: artifact.content } : undefined;
+  }
+
   getSnapshots(projectRef: string): Snapshot[] {
     const project = this.getProject(projectRef);
     return this.store.snapshots.filter((snapshot) => snapshot.projectId === project.id);

@@ -1,14 +1,18 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { ConfigCipher, sha256 } from "../core/security.js";
 import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
 import { ProjectRegistry } from "../services/project-registry.js";
 import { ProjectQueryService } from "../services/query.js";
 import { AskProjectService } from "../services/ask-project.js";
-import { ObservatoryToolService } from "../mcp/tools.js";
+import { handleMcpRequest, type McpJsonRpcRequest } from "../mcp/server.js";
+import { McpToolError, ObservatoryToolService } from "../mcp/tools.js";
+import type { ObservatoryStore } from "../core/store.js";
 import type { ProjectSource, SourceConfig, SourceType } from "../domain/types.js";
 
 export interface ObservatoryHttpServices {
+  /** Present in production; optional to retain the small in-memory test seam. */
+  store?: ObservatoryStore;
   registry: ProjectRegistry;
   refresh: RefreshOrchestrator;
   queries: ProjectQueryService;
@@ -64,13 +68,9 @@ async function route(request: IncomingMessage, response: ServerResponse, service
     const csrf = issueCsrfToken(request);
     return sendHtml(response, projectScreen(services, browserSegments[1], page, url.searchParams.get("onboarding") === "complete", csrf.token, hasOnboardingOperatorAccess(request)), 200, csrf.headers);
   }
-  if (method === "GET" && path === "/mcp/tools") return send(response, 200, { tools: services.tools.listTools() });
-  if (method === "POST" && path === "/mcp/call") {
-    const body = await jsonBody(request);
-    if (typeof body.name !== "string") throw new Error("'name' is required.");
-    const input = isRecord(body.arguments) ? body.arguments : {};
-    return send(response, 200, { result: await services.tools.call(body.name, input) });
-  }
+  if (path === "/mcp") return handleRemoteMcp(request, response, services);
+  if (path === "/mcp/tools") return handleLegacyMcpTools(request, response, services);
+  if (path === "/mcp/call") return handleLegacyMcpCall(request, response, services);
   if (path === "/api/projects" && method === "GET") return send(response, 200, services.queries.listProjects());
   if (path === "/api/projects" && method === "POST") {
     assertOperator(request);
@@ -122,6 +122,94 @@ async function route(request: IncomingMessage, response: ServerResponse, service
   if (resource === "search" && method === "GET") return send(response, 200, services.queries.searchProject(projectId, url.searchParams.get("q") ?? "", { domain: url.searchParams.get("domain") ?? undefined, type: url.searchParams.get("type") as import("../domain/types.js").KnowledgeType | undefined, limit: numberQuery(url, "limit") }));
   if (resource === "deployments" && method === "GET") return send(response, 200, services.queries.getDeployments(projectId, url.searchParams.get("environment") ?? undefined, numberQuery(url, "limit")));
   return send(response, 404, { error: "Route not found." });
+}
+
+type McpErrorCode = "unauthorized" | "project_not_found" | "invalid_question" | "invalid_query" | "evidence_not_found" | "evidence_not_in_project" | "invalid_path" | "excerpt_range_too_large" | "insufficient_evidence" | "internal_error";
+
+async function handleRemoteMcp(request: IncomingMessage, response: ServerResponse, services: ObservatoryHttpServices): Promise<void> {
+  if (!hasMcpReadAccess(request)) return sendMcpError(response, null, "unauthorized", 401);
+  if (request.method !== "POST") return sendMcpError(response, null, "invalid_query", 405);
+  let rpcRequest: McpJsonRpcRequest;
+  try {
+    rpcRequest = await jsonBody(request, 64_000) as unknown as McpJsonRpcRequest;
+    if (rpcRequest.jsonrpc !== "2.0" || typeof rpcRequest.method !== "string") throw new Error("invalid request");
+  } catch {
+    return sendMcpError(response, null, "invalid_query", 400);
+  }
+  const id = validMcpId(rpcRequest.id);
+  try {
+    const result = await handleMcpRequest(rpcRequest, services.tools);
+    if (rpcRequest.method === "tools/call") await recordMcpRead(services.store, rpcRequest);
+    return send(response, 200, { jsonrpc: "2.0", id, result });
+  } catch (error) {
+    const code = mcpErrorCode(error);
+    if (rpcRequest.method === "tools/call") await recordMcpRead(services.store, rpcRequest, code);
+    return sendMcpError(response, id, code, 200);
+  }
+}
+
+async function handleLegacyMcpTools(request: IncomingMessage, response: ServerResponse, services: ObservatoryHttpServices): Promise<void> {
+  if (!hasMcpReadAccess(request)) return send(response, 401, { error: { code: "unauthorized" } });
+  if (request.method !== "GET") return send(response, 405, { error: { code: "invalid_query" } });
+  return send(response, 200, { tools: services.tools.listTools() });
+}
+
+async function handleLegacyMcpCall(request: IncomingMessage, response: ServerResponse, services: ObservatoryHttpServices): Promise<void> {
+  if (!hasMcpReadAccess(request)) return send(response, 401, { error: { code: "unauthorized" } });
+  if (request.method !== "POST") return send(response, 405, { error: { code: "invalid_query" } });
+  try {
+    const body = await jsonBody(request, 64_000);
+    if (typeof body.name !== "string" || !isRecord(body.arguments ?? {})) throw new McpToolError("invalid_query");
+    const result = await services.tools.call(body.name, body.arguments as Record<string, unknown>);
+    await recordMcpRead(services.store, { jsonrpc: "2.0", method: "tools/call", params: { name: body.name, arguments: body.arguments } });
+    return send(response, 200, { result });
+  } catch (error) {
+    const code = mcpErrorCode(error);
+    return send(response, 400, { error: { code } });
+  }
+}
+
+function hasMcpReadAccess(request: IncomingMessage): boolean {
+  const configuredToken = process.env.OBSERVATORY_MCP_READ_TOKEN;
+  const authorization = request.headers.authorization;
+  if (!configuredToken || typeof authorization !== "string") return false;
+  if (process.env.NODE_ENV === "production" && !isHttpsRequest(request)) return false;
+  return sameSecret(authorization, `Bearer ${configuredToken}`);
+}
+
+function isHttpsRequest(request: IncomingMessage): boolean {
+  const forwarded = request.headers["x-forwarded-proto"];
+  return typeof forwarded === "string" && forwarded.split(",")[0]?.trim() === "https";
+}
+
+function validMcpId(id: McpJsonRpcRequest["id"]): string | number | null {
+  return typeof id === "string" || typeof id === "number" || id === null ? id : null;
+}
+
+function sendMcpError(response: ServerResponse, id: string | number | null, code: McpErrorCode, status: number): void {
+  send(response, status, { jsonrpc: "2.0", id, error: { code: -32_000, message: "MCP request failed.", data: { code } } });
+}
+
+function mcpErrorCode(error: unknown): McpErrorCode {
+  if (error instanceof McpToolError) return error.code;
+  return "internal_error";
+}
+
+async function recordMcpRead(store: ObservatoryStore | undefined, request: McpJsonRpcRequest, outcome: McpErrorCode | "success" = "success"): Promise<void> {
+  if (!store) return;
+  try {
+    const name = request.params?.name;
+    store.auditEvents.push({
+      id: randomUUID(),
+      actorId: "mcp_read",
+      action: "mcp.read",
+      metadata: { credentialClass: "mcp_read", tool: typeof name === "string" ? name.slice(0, 120) : request.method, outcome },
+      createdAt: new Date().toISOString(),
+    });
+    await store.flush();
+  } catch {
+    // Observability must never turn a successful, bounded read into a failure.
+  }
 }
 
 function assertOperator(request: IncomingMessage): void {

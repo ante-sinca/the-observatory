@@ -1,136 +1,124 @@
-# HTTP and AI Tool Contract — v0.1
+# HTTP and secure MCP contract — v0.1
 
-All interfaces are read-only except project administration and manual refresh.
-
-All state and knowledge responses represent Observatory's resolved
-interpretation and include source provenance. Callers should use the returned
-snapshot and resolution status to understand the point-in-time context.
+Project Observatory is read-only with respect to every observed project,
+provider, deployment, database, and payment system. Its resolved snapshots are
+the only source exposed to browser, HTTP, and MCP callers.
 
 ## HTTP API
 
-### Projects
-GET /api/projects
-POST /api/projects
-GET /api/projects/:projectId
-PATCH /api/projects/:projectId
+Read endpoints are available under `/api/projects`. Project and source
+administration remain separate HTTP-only operations protected by
+`OBSERVATORY_OPERATOR_TOKEN`:
 
-### Sources
-POST /api/projects/:projectId/sources
-GET /api/projects/:projectId/sources
-POST /api/projects/:projectId/sources/:sourceId/health
+- `GET /api/projects`
+- `POST /api/projects`
+- `GET|PATCH /api/projects/:projectId`
+- `GET|POST /api/projects/:projectId/sources`
+- `POST /api/projects/:projectId/sources/:sourceId/health`
+- `POST /api/projects/:projectId/refresh`
+- `GET /api/projects/:projectId/refresh-runs`
+- `GET /api/projects/:projectId/state`
+- `GET /api/projects/:projectId/snapshots`
+- `GET /api/projects/:projectId/movements`
+- `GET /api/projects/:projectId/conflicts`
+- `GET /api/projects/:projectId/knowledge`
+- `GET /api/projects/:projectId/search?q=...`
+- `GET /api/projects/:projectId/deployments`
+- `POST /api/projects/:projectId/ask`
 
-### Refresh
-POST /api/projects/:projectId/refresh
-GET /api/projects/:projectId/refresh-runs
+`POST /api/projects/:projectId/ask` accepts `{ "question": "..." }` and is
+the same `AskProjectService` used by MCP. It is bounded to 2,000 question
+characters and returns an evidence-backed answer, current repository revision,
+provenance, explicit status, and relevant unresolved conflicts.
 
-### State
-GET /api/projects/:projectId/state
-GET /api/projects/:projectId/snapshots
-GET /api/projects/:projectId/snapshots/:snapshotId
-GET /api/projects/:projectId/movements
-GET /api/projects/:projectId/conflicts
+## Remote MCP
 
-### Knowledge
-GET /api/projects/:projectId/knowledge
-GET /api/projects/:projectId/knowledge/:itemId
-GET /api/projects/:projectId/search?q=...
+The stable production endpoint is `POST https://<deployment>/mcp`. It accepts
+JSON-RPC 2.0 requests for `initialize`, `tools/list`, and `tools/call`, and
+returns standard MCP tool content plus `structuredContent`. The existing
+`node dist/index.js --mcp` stdio transport remains available for local MCP
+clients with its established local read-tool catalogue. The restricted remote
+catalogue below applies only to HTTP MCP. Compatibility paths `GET /mcp/tools`
+and `POST /mcp/call` use the same read authentication but are not the ChatGPT
+connection endpoint.
 
-### Deployments
-GET /api/projects/:projectId/deployments
+Every remote request needs:
 
-### Ask Project
-POST /api/projects/:projectId/ask
+```http
+Authorization: Bearer <OBSERVATORY_MCP_READ_TOKEN>
+Content-Type: application/json
+```
 
-Accepts `{ "question": "..." }` and returns a project-scoped, evidence-backed
-answer using the latest durable snapshot. Responses include an explicit status,
-repository revision, ranked provenance, and any relevant unresolved conflicts.
-Ask is read-only, bounded to 2,000 question characters, and uses
-`Cache-Control: no-store`.
+`OBSERVATORY_MCP_READ_TOKEN` is an explicit `mcp_read` credential class. It
+is never interchangeable with `OBSERVATORY_OPERATOR_TOKEN`, cannot call a
+refresh or administrative route, and must be stored only as a deployment
+secret. The server compares bearer values using `timingSafeEqual`, logs neither
+the token nor tool arguments, sends `Cache-Control: no-store`, and rejects
+remote MCP traffic in production unless Vercel forwards HTTPS.
 
-## AI/MCP tools
+The remote tool catalogue is deliberately limited to read-only tools:
 
-### list_projects
-Returns project IDs, names and current summary.
+- `list_projects`
+- `get_project_state`
+- `search_project`
+- `get_evidence`
+- `get_file_excerpt`
+- `get_recent_movements`
+- `ask_project`
 
-### get_project_state
-Input:
-- project
+All tool annotations declare `readOnlyHint: true` and no destructive/open-world
+capability. No tool can register a project, change a source, refresh evidence,
+write a file, deploy, execute SQL, or invoke an observed provider mutation.
 
-Returns:
-- current repository revision
-- current deployment revision
-- source health
-- current-state summary
-- unresolved conflicts
-- latest movements
+### Snapshot, evidence, and isolation rules
 
-### search_project
-Input:
-- project
-- query
-- optional domain
-- optional type
-- optional limit
+`search_project` and `ask_project` use the current durable snapshot for the
+selected project. `get_evidence` and `get_file_excerpt` only return an artifact
+at the current repository revision. File paths are exact, repository-relative,
+case-sensitive observed paths; absolute paths, backslashes, and traversal
+segments are rejected. Artifact IDs are scoped to the requested project, and a
+cross-project ID returns `evidence_not_in_project` with no artifact content or
+metadata.
 
-Returns ranked knowledge items with provenance.
+Search results, file excerpts, evidence, movements, and question input have
+strict output/input limits. Text is redacted with the shared safe-text policy.
+Excerpts are capped at 80 lines and 6,000 characters; list/search/movement
+responses are capped as advertised by their schemas. Tool responses include
+the repository revision and artifact path/line range when evidence is present.
+`ask_project` deliberately omits the supplied question from its remote result.
 
-### get_recent_changes
-Input:
-- project
-- since or snapshot
+Authenticated `tools/call` events write a durable `mcp.read` audit event with
+only credential class, tool name, outcome, and timestamp. Questions, queries,
+tokens, HTML, source configuration, and credential values are never written to
+that event.
 
-Returns movements.
+### Stable remote error data
 
-### get_deployments
-Input:
-- project
-- optional environment
-- optional limit
+JSON-RPC errors use `error.data.code` with one of:
 
-### get_decisions
-Input:
-- project
-- optional domain
+`unauthorized`, `project_not_found`, `invalid_question`, `invalid_query`,
+`evidence_not_found`, `evidence_not_in_project`, `invalid_path`,
+`excerpt_range_too_large`, `insufficient_evidence`, or `internal_error`.
 
-### get_known_risks
-Input:
-- project
+Unauthorized requests use HTTP 401 and the same `unauthorized` code whether
+the credential is absent, malformed, wrong, unconfigured, or presented over a
+non-HTTPS production request. Tool execution errors preserve JSON-RPC's 200
+response semantics and put their stable code in `error.data.code`.
 
-### get_knowledge_item
-Input:
-- project
-- item_id
+## Connect from ChatGPT
 
-Returns complete knowledge item and provenance.
+1. Set a new long random `OBSERVATORY_MCP_READ_TOKEN` in the Vercel Production
+   environment. Do not reuse or expose the operator token. Redeploy after
+   adding it.
+2. Confirm `POST /mcp` rejects an absent bearer token, then initialize it with
+   the read token over the public HTTPS deployment URL.
+3. In ChatGPT developer mode, create a custom MCP connection and supply the
+   public HTTPS URL including `/mcp`; configure its connection authentication
+   to send the read-only bearer token. Scan/refresh the catalogue and verify
+   only the seven read-only tools above appear.
+4. Run project-scoped prompts for HomeGift and HomeBound, then verify a
+   cross-project artifact ID, traversal path, blank question, and oversized
+   excerpt fail with the documented machine codes.
 
-### compare_snapshots
-Input:
-- project
-- from_snapshot
-- to_snapshot
-
-### get_source_artifact
-Input:
-- project
-- artifact_id
-
-Returns safe indexed content only. Secret/private excluded artifacts must never be returned.
-
-### ask_project
-Input:
-- project
-- question
-
-Returns the same stable answer contract as `POST /api/projects/:projectId/ask`.
-It is backed by `AskProjectService`, so browser and MCP retrieval, ranking,
-grounding, conflict handling, and project isolation are identical.
-
-## Explicitly absent from v0.1
-
-- edit_file
-- commit
-- merge
-- deploy
-- execute_sql
-- send_payment
-- mutate_production
+ChatGPT connection controls and availability can vary by account/workspace.
+Follow the current [OpenAI connection and test guidance](https://developers.openai.com/plugins/deploy/connect-chatgpt): it calls for a public HTTPS `/mcp` endpoint, tool discovery, authentication validation, and a refresh after server metadata changes.

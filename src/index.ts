@@ -22,13 +22,14 @@ export async function createObservatory(options: { store?: ObservatoryStore } = 
   const queries = new ProjectQueryService(store);
   const ask = new AskProjectService(store, queries);
   const tools = new ObservatoryToolService(queries, ask);
-  return { store, adapters, registry, refresh, queries, ask, tools };
+  const stdioTools = new ObservatoryToolService(queries, ask, "local");
+  return { store, adapters, registry, refresh, queries, ask, tools, stdioTools };
 }
 
 if (process.argv[1] && new URL(`file://${process.argv[1].replaceAll("\\", "/")}`).href === import.meta.url) {
   createObservatory().then((observatory) => {
     if (process.argv.includes("--mcp")) {
-      runMcpStdioServer(observatory.tools);
+      runMcpStdioServer(observatory.stdioTools);
     } else {
       const port = Number(process.env.PORT ?? 3000);
       createHttpServer(observatory).listen(port, () => console.log(`Project Observatory listening on http://localhost:${port}`));
