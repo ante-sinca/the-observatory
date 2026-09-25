@@ -7,7 +7,7 @@
   "scripts": {
     "build": "node ./node_modules/typescript/bin/tsc -p tsconfig.json",
     "check": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
-    "test": "node ./node_modules/typescript/bin/tsc -p tsconfig.json && node --test dist/tests/acceptance.test.js dist/tests/postgres.acceptance.test.js dist/tests/ask-project.test.js dist/tests/mcp-remote.test.js",
+    "test": "node ./node_modules/typescript/bin/tsc -p tsconfig.json && node --test dist/tests/acceptance.test.js dist/tests/postgres.acceptance.test.js dist/tests/ask-project.test.js dist/tests/mcp-remote.test.js dist/tests/oauth-mcp.test.js",
     "migrate": "node ./node_modules/typescript/bin/tsc -p tsconfig.json && node dist/core/migrations.js",
     "start": "node dist/index.js",
     "dev": "node --watch --import tsx src/index.ts"
@@ -23,6 +23,7 @@
   "dependencies": {
     "@types/pg": "^8.23.1",
     "@vercel/functions": "^3.9.9",
+    "jose": "^5.10.0",
     "pg": "^8.23.0"
   }
 }

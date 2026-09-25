@@ -53,12 +53,19 @@ a local/server runtime.
 
 The production MCP endpoint is `POST /mcp` over public HTTPS. It accepts
 authenticated JSON-RPC 2.0 MCP requests and exposes only seven bounded
-read-only tools. Set a dedicated `OBSERVATORY_MCP_READ_TOKEN` in Vercel; it is
-not an operator credential and cannot administer projects or refresh sources.
-In production, `/mcp` fails closed unless the request is HTTPS and carries the
-matching bearer value. It emits `Cache-Control: no-store`, redacts returned
-text, and records minimal `mcp.read` audit events without questions, queries,
-or tokens.
+read-only tools. Existing direct clients may retain the dedicated
+`OBSERVATORY_MCP_READ_TOKEN`; it is not an operator credential and cannot
+administer projects or refresh sources.
+
+ChatGPT connections use an established OAuth/OIDC provider (for example,
+Auth0) with Authorization Code + PKCE. Configure the issuer, resource audience,
+owner subject allowlist, and optional JWKS URI in Vercel using the documented
+`OBSERVATORY_OAUTH_*` variables. Observatory is only the OAuth resource server:
+it discovers the provider through protected-resource metadata, verifies RS256
+access tokens against JWKS, and never issues sessions, authorization codes, or
+refresh tokens. In production, `/mcp` fails closed unless the request is HTTPS
+and authenticated. It emits `Cache-Control: no-store`, redacts returned text,
+and records minimal audit events without questions, queries, or tokens.
 
 Use the detailed [remote MCP contract and ChatGPT connection steps](API_AND_MCP.md).
 

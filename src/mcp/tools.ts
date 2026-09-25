@@ -1,5 +1,6 @@
 import { safeText } from "../core/security.js";
 import type { KnowledgeType, Movement, SourceArtifact } from "../domain/types.js";
+import { oauthScopeForTool } from "./oauth.js";
 import { AskProjectService } from "../services/ask-project.js";
 import { ProjectQueryService } from "../services/query.js";
 
@@ -8,6 +9,7 @@ export interface McpToolDefinition {
   description: string;
   inputSchema: Record<string, unknown>;
   annotations: { readOnlyHint: true; destructiveHint: false; openWorldHint: false };
+  securitySchemes?: Array<{ type: "oauth2"; scopes: string[] }>;
 }
 
 export type McpToolErrorCode =
@@ -258,7 +260,14 @@ function listProjectsForMcp(projects: ReturnType<ProjectQueryService["listProjec
 }
 
 function definition(name: string, description: string, properties: Record<string, unknown>, required: string[] = []): McpToolDefinition {
-  return { name, description, inputSchema: { type: "object", properties, required, additionalProperties: false }, annotations: readOnlyAnnotations };
+  const scope = oauthScopeForTool(name);
+  return {
+    name,
+    description,
+    inputSchema: { type: "object", properties, required, additionalProperties: false },
+    annotations: readOnlyAnnotations,
+    ...(scope ? { securitySchemes: [{ type: "oauth2" as const, scopes: [scope] }] } : {}),
+  };
 }
 
 function requiredProject(input: Record<string, unknown>): string {

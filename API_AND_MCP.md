@@ -42,7 +42,7 @@ catalogue below applies only to HTTP MCP. Compatibility paths `GET /mcp/tools`
 and `POST /mcp/call` use the same read authentication but are not the ChatGPT
 connection endpoint.
 
-Every remote request needs:
+Remote access has two separate, non-interchangeable authentication paths:
 
 ```http
 Authorization: Bearer <OBSERVATORY_MCP_READ_TOKEN>
@@ -56,6 +56,60 @@ secret. The server compares bearer values using `timingSafeEqual`, logs neither
 the token nor tool arguments, sends `Cache-Control: no-store`, and rejects
 remote MCP traffic in production unless Vercel forwards HTTPS.
 
+This fixed bearer path remains for existing direct clients. ChatGPT uses OAuth
+2.1 with an established provider (Auth0-compatible OIDC/OAuth) instead. The
+provider owns Authorization Code + PKCE (`S256`), consent, login, and token
+issuance. Observatory is only a resource server: it has no authorization-code
+route, browser session, refresh-token store, or custom token signing key.
+
+Configure the following Vercel Production variables before enabling OAuth:
+
+| Variable | Classification | Required value |
+| --- | --- | --- |
+| `OBSERVATORY_MCP_PUBLIC_ORIGIN` | Server configuration, not secret | `https://the-observatory-blue.vercel.app` |
+| `OBSERVATORY_OAUTH_ISSUER` | Server configuration, public provider identifier | Exact issuer from the provider, including its canonical trailing slash if supplied |
+| `OBSERVATORY_OAUTH_AUDIENCE` | Server configuration, not secret | Exactly the same canonical resource origin |
+| `OBSERVATORY_OAUTH_JWKS_URI` | Server configuration, public endpoint | Optional; defaults to `<issuer>/.well-known/jwks.json` |
+| `OBSERVATORY_OAUTH_ALLOWED_SUBJECT` | Server-only access-control allowlist | The exact provider `sub` for the Observatory owner |
+| `OBSERVATORY_MCP_READ_TOKEN` | Deployment secret | Optional legacy fixed bearer credential; never the operator token |
+| `OBSERVATORY_OPERATOR_TOKEN` | Deployment secret | Operator-only administration credential; never an OAuth or MCP-read token |
+
+Use the provider's documented OIDC/OAuth discovery and Universal Login setup.
+Create a ChatGPT client/application at that provider with Authorization Code,
+PKCE `S256`, the scopes below, and the redirect URI shown by ChatGPT during
+connection. Do not add a local OAuth issuer or substitute a HomeGift/HomeBound
+credential for any of these values.
+
+### OAuth protected-resource discovery and enforcement
+
+`GET /.well-known/oauth-protected-resource` returns no-store protected-resource
+metadata for the canonical resource
+`https://the-observatory-blue.vercel.app`, including its `authorization_servers`
+issuer and supported scopes. It is available only after the complete OAuth
+resource-server configuration above is present; incomplete configuration returns
+a generic 503 rather than partial metadata.
+
+Unauthenticated `POST /mcp` requests receive HTTP 401 with a stable JSON-RPC
+`unauthorized` error and this form of challenge:
+
+```http
+WWW-Authenticate: Bearer resource_metadata="https://the-observatory-blue.vercel.app/.well-known/oauth-protected-resource", scope="projects:list project:read project:ask knowledge:search evidence:read movements:read", error="invalid_token", error_description="Authentication is required."
+Cache-Control: no-store
+```
+
+For an unauthenticated or under-scoped `tools/call`, the HTTP 401 is paired
+with an MCP error result whose `_meta["mcp/www_authenticate"]` contains the
+same challenge (with `invalid_token` or `insufficient_scope`). This is the
+runtime signal ChatGPT uses to show its OAuth-linking UI.
+
+OAuth access tokens must be bearer JWT access tokens with `typ` `at+jwt` or
+`JWT`, algorithm `RS256`, a signature from the configured JWKS, the exact
+configured issuer, the canonical resource audience, an unexpired `exp`, any
+applicable valid `nbf`, and the allowlisted owner `sub`. Tokens that are
+malformed, expired, premature, wrong-issuer, wrong-audience, wrongly signed,
+wrong-type, or missing the required scope fail closed. The token and its claims
+are never logged.
+
 The remote tool catalogue is deliberately limited to read-only tools:
 
 - `list_projects`
@@ -65,6 +119,19 @@ The remote tool catalogue is deliberately limited to read-only tools:
 - `get_file_excerpt`
 - `get_recent_movements`
 - `ask_project`
+
+Each remote tool advertises the matching OAuth 2.1 `securitySchemes` scope and
+the server independently enforces it at invocation time:
+
+| Tool | Required scope |
+| --- | --- |
+| `list_projects` | `projects:list` |
+| `get_project_state` | `project:read` |
+| `ask_project` | `project:ask` |
+| `search_project` | `knowledge:search` |
+| `get_evidence` | `evidence:read` |
+| `get_file_excerpt` | `evidence:read` |
+| `get_recent_movements` | `movements:read` |
 
 All tool annotations declare `readOnlyHint: true` and no destructive/open-world
 capability. No tool can register a project, change a source, refresh evidence,
@@ -88,9 +155,10 @@ the repository revision and artifact path/line range when evidence is present.
 `ask_project` deliberately omits the supplied question from its remote result.
 
 Authenticated `tools/call` events write a durable `mcp.read` audit event with
-only credential class, tool name, outcome, and timestamp. Questions, queries,
-tokens, HTML, source configuration, and credential values are never written to
-that event.
+only credential class, authentication method, granted scope names, tool name,
+outcome, and timestamp. Failed OAuth validation is recorded as a separate
+minimal event. Questions, queries, tokens, token claims, HTML, source
+configuration, and credential values are never written to either event.
 
 ### Stable remote error data
 
@@ -101,24 +169,32 @@ JSON-RPC errors use `error.data.code` with one of:
 `excerpt_range_too_large`, `insufficient_evidence`, or `internal_error`.
 
 Unauthorized requests use HTTP 401 and the same `unauthorized` code whether
-the credential is absent, malformed, wrong, unconfigured, or presented over a
-non-HTTPS production request. Tool execution errors preserve JSON-RPC's 200
-response semantics and put their stable code in `error.data.code`.
+the credential is absent, malformed, wrong, unconfigured, under-scoped, or
+presented over a non-HTTPS production request. OAuth-related 401s include the
+protected-resource `WWW-Authenticate` challenge. Tool execution errors preserve
+JSON-RPC's 200 response semantics and put their stable code in `error.data.code`.
 
 ## Connect from ChatGPT
 
-1. Set a new long random `OBSERVATORY_MCP_READ_TOKEN` in the Vercel Production
-   environment. Do not reuse or expose the operator token. Redeploy after
-   adding it.
-2. Confirm `POST /mcp` rejects an absent bearer token, then initialize it with
-   the read token over the public HTTPS deployment URL.
-3. In ChatGPT developer mode, create a custom MCP connection and supply the
-   public HTTPS URL including `/mcp`; configure its connection authentication
-   to send the read-only bearer token. Scan/refresh the catalogue and verify
-   only the seven read-only tools above appear.
-4. Run project-scoped prompts for HomeGift and HomeBound, then verify a
-   cross-project artifact ID, traversal path, blank question, and oversized
-   excerpt fail with the documented machine codes.
+1. In the OAuth provider, register the exact production resource audience,
+   permit Authorization Code with PKCE `S256`, request only the seven scopes
+   above, and add the redirect URI ChatGPT shows when the connection is created.
+   Restrict access to the owner subject configured in
+   `OBSERVATORY_OAUTH_ALLOWED_SUBJECT`.
+2. Set the complete `OBSERVATORY_OAUTH_*` configuration in Vercel Production
+   and redeploy. Keep any legacy `OBSERVATORY_MCP_READ_TOKEN` separate; never
+   reuse `OBSERVATORY_OPERATOR_TOKEN`.
+3. Check the protected-resource metadata endpoint, then confirm a bearer-less
+   `POST /mcp` returns HTTP 401 with the `resource_metadata` challenge and no
+   stack trace.
+4. Open the existing ChatGPT MCP connection, use
+   `https://the-observatory-blue.vercel.app/mcp`, complete the provider login,
+   and refresh its tool catalogue. Verify only the seven read-only tools and
+   their scopes appear.
+5. Make project-scoped authenticated tool calls for the registered project(s),
+   then verify a cross-project artifact ID, traversal path, blank question,
+   oversized excerpt, and missing-scope call fail with the documented machine
+   codes.
 
 ChatGPT connection controls and availability can vary by account/workspace.
-Follow the current [OpenAI connection and test guidance](https://developers.openai.com/plugins/deploy/connect-chatgpt): it calls for a public HTTPS `/mcp` endpoint, tool discovery, authentication validation, and a refresh after server metadata changes.
+Follow the current [OpenAI MCP authentication guidance](https://developers.openai.com/plugins/build/auth) and [connection/test guidance](https://developers.openai.com/plugins/deploy/connect-chatgpt): they cover protected-resource discovery, provider-hosted OAuth, a public HTTPS `/mcp` endpoint, authentication validation, and a refresh after server metadata changes.
