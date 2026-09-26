@@ -1,4 +1,4 @@
-# Project Observatory v0.2B
+# Project Observatory v0.2C
 
 ## Implementation
 
@@ -39,7 +39,7 @@ health probe. Start the same state service as an MCP stdio process with:
 node dist/index.js --mcp
 ```
 
-### Optional local Ollama / Qwen assistant
+### Optional Ollama / Qwen assistant
 
 Ollama is an operator-managed local dependency; Observatory neither installs,
 starts, nor deploys it. Install and run Ollama using its official instructions,
@@ -71,6 +71,36 @@ default), this endpoint returns a controlled 503 while `/ask`, the browser,
 ingestion, and MCP continue normally. Do not set a localhost base URL for a
 production deployment. The adapter has no persisted conversational memory and
 intentionally provides no write or execution capability.
+
+#### Production OCI inference host
+
+Observatory stays on Vercel. A separately operated OCI ARM64 VM may host the
+optional CPU-only Ollama/Qwen runtime behind an authenticated HTTPS reverse
+proxy; Ollama itself must bind only to `127.0.0.1:11434`, never a public
+interface. In Vercel Production configure:
+
+```text
+OBSERVATORY_AI_ENABLED=true
+OBSERVATORY_ASSISTANT_UI_ENABLED=true
+OBSERVATORY_AI_PROVIDER=ollama
+OBSERVATORY_AI_MODEL=<approved-qwen-model>
+OBSERVATORY_AI_BASE_URL=https://<protected-inference-host>
+OBSERVATORY_AI_AUTH_MODE=bearer
+OBSERVATORY_AI_AUTH_TOKEN=<separate-generated-secret>
+OBSERVATORY_AI_TIMEOUT_MS=120000
+```
+
+Production configuration fails closed without HTTPS and bearer credentials.
+The token and endpoint stay server-side, are never sent to browser clients or
+error responses, and the provider refuses redirects. `GET /api/assistant/health`
+returns only a cached safe availability category; it is not an Ollama proxy.
+When inference is unreachable, unauthorized, slow, or malformed, Assistant
+returns a controlled unavailable state while Ask Project, ingestion, snapshots,
+browser project pages, and MCP remain fully deterministic and available.
+
+Use the complete [OCI inference host package and runbook](deploy/oci-ollama/README.md)
+for ARM64 sizing guidance, systemd, Caddy HTTPS/bearer authentication, firewall
+rules, model lifecycle, smoke testing, recovery, and OCI free-tier caveats.
 
 #### Browser Assistant v0.2B smoke test
 

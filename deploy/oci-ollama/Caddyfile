@@ -1,0 +1,49 @@
+# Install as /etc/caddy/Caddyfile after setting OBSERVATORY_AI_PUBLIC_HOSTNAME
+# and OBSERVATORY_AI_AUTH_TOKEN in /etc/observatory-inference.env. Caddy reads
+# the token from its systemd EnvironmentFile; do not put the token in this file.
+{$OBSERVATORY_AI_PUBLIC_HOSTNAME} {
+  # Caddy obtains and renews HTTPS certificates. Deliberately omit access logs:
+  # the reverse proxy never needs to record Authorization request headers.
+
+  @authenticatedChat {
+    method POST
+    path /api/chat
+    header Authorization "Bearer {$OBSERVATORY_AI_AUTH_TOKEN}"
+  }
+  @authenticatedVersion {
+    method GET
+    path /api/version
+    header Authorization "Bearer {$OBSERVATORY_AI_AUTH_TOKEN}"
+  }
+  @protectedOllamaPath path /api/chat /api/version
+
+  handle @authenticatedChat {
+    request_body {
+      max_size 2MB
+    }
+    reverse_proxy 127.0.0.1:11434 {
+      # Caddy verifies the client token; Ollama never receives or logs it.
+      header_up -Authorization
+      transport http {
+        dial_timeout 5s
+        response_header_timeout 125s
+        read_timeout 125s
+        write_timeout 125s
+      }
+    }
+  }
+
+  handle @authenticatedVersion {
+    reverse_proxy 127.0.0.1:11434 {
+      header_up -Authorization
+      transport http {
+        dial_timeout 5s
+        response_header_timeout 15s
+      }
+    }
+  }
+
+  # Do not reveal whether a valid token was supplied for an allowed endpoint.
+  respond @protectedOllamaPath "Unauthorized" 401
+  respond "Not found" 404
+}

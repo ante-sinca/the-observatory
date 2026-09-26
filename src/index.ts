@@ -13,6 +13,7 @@ import { AskProjectService } from "./services/ask-project.js";
 import { AdapterRegistry, RefreshOrchestrator } from "./services/refresh.js";
 import { ObservatoryAgentService } from "./intelligence/agent.js";
 import { assistantUiEnabledFromEnvironment, intelligenceConfigFromEnvironment } from "./intelligence/config.js";
+import { AssistantProviderHealthService } from "./intelligence/health.js";
 import { OllamaProvider } from "./intelligence/ollama.js";
 import type { IntelligenceProvider } from "./intelligence/provider.js";
 
@@ -28,14 +29,15 @@ export async function createObservatory(options: { store?: ObservatoryStore; int
   const intelligence = intelligenceConfigFromEnvironment();
   const assistantUiEnabled = assistantUiEnabledFromEnvironment();
   const provider = intelligence.enabled
-    ? options.intelligenceProvider ?? new OllamaProvider({ baseUrl: intelligence.baseUrl!, timeoutMs: intelligence.timeoutMs! })
+    ? options.intelligenceProvider ?? new OllamaProvider({ baseUrl: intelligence.baseUrl!, timeoutMs: intelligence.timeoutMs!, bearerToken: intelligence.authToken })
     : undefined;
   const agent = provider && intelligence.model
     ? new ObservatoryAgentService(provider, queries, ask, { model: intelligence.model })
     : undefined;
   const tools = new ObservatoryToolService(queries, ask);
   const stdioTools = new ObservatoryToolService(queries, ask, "local");
-  return { store, adapters, registry, refresh, queries, ask, agent, intelligence, assistantUiEnabled, tools, stdioTools };
+  const assistantHealth = new AssistantProviderHealthService(intelligence, provider);
+  return { store, adapters, registry, refresh, queries, ask, agent, intelligence, assistantUiEnabled, assistantHealth, tools, stdioTools };
 }
 
 if (process.argv[1] && new URL(`file://${process.argv[1].replaceAll("\\", "/")}`).href === import.meta.url) {

@@ -26,6 +26,7 @@ administration remain separate HTTP-only operations protected by
 - `GET /api/projects/:projectId/deployments`
 - `POST /api/projects/:projectId/ask`
 - `POST /api/projects/:projectId/assistant`
+- `GET /api/assistant/health`
 
 `POST /api/projects/:projectId/ask` accepts `{ "question": "..." }` and is
 the same `AskProjectService` used by MCP. It is bounded to 2,000 question
@@ -84,6 +85,15 @@ only when `OBSERVATORY_ASSISTANT_UI_ENABLED=true`; otherwise the Assistant nav
 is hidden and direct browser navigation returns a controlled 503 page with a
 link to `/projects/:projectId/ask`. This browser gate does not grant provider
 access, change the API contract, or add conversational state to MCP.
+
+`GET /api/assistant/health` is a narrow server-side provider status surface for
+the Assistant UI and operator diagnostics. It returns only the configured
+provider/model, a cached safe status (`disabled`, `configured`, `reachable`,
+`unauthorized`, `unavailable`, `timeout`, or `malformed_response`),
+availability, and optional latency. It does not expose model endpoint URLs,
+bearer tokens, prompts, evidence, or raw
+provider responses. It calls no model-generation endpoint and cannot affect
+Ask Project, MCP, ingestion, snapshots, or deterministic queries.
 
 ## Remote MCP
 

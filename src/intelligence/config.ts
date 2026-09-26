@@ -4,6 +4,9 @@ export interface IntelligenceConfig {
   model?: string;
   baseUrl?: string;
   timeoutMs?: number;
+  authMode?: "bearer";
+  /** Secret retained only in server-side composition/provider options. */
+  authToken?: string;
   /** Safe, generic state only. Do not expose the rejected value. */
   reason?: "disabled" | "invalid_configuration";
 }
@@ -26,10 +29,11 @@ export function intelligenceConfigFromEnvironment(environment: Environment = pro
   const model = environment.OBSERVATORY_AI_MODEL;
   const baseUrl = environment.OBSERVATORY_AI_BASE_URL ?? DEFAULT_BASE_URL;
   const timeoutMs = parseTimeout(environment.OBSERVATORY_AI_TIMEOUT_MS);
-  if (provider !== "ollama" || !validModel(model) || !validBaseUrl(baseUrl) || timeoutMs === undefined) {
+  const auth = authenticationFromEnvironment(environment);
+  if (provider !== "ollama" || !validModel(model) || !validBaseUrl(baseUrl) || timeoutMs === undefined || !auth || (environment.NODE_ENV === "production" && (!auth.authToken || !isHttps(baseUrl)))) {
     return { enabled: false, reason: "invalid_configuration" };
   }
-  return { enabled: true, provider, model, baseUrl: canonicalBaseUrl(baseUrl), timeoutMs };
+  return { enabled: true, provider, model, baseUrl: canonicalBaseUrl(baseUrl), timeoutMs, ...auth };
 }
 
 /** UI exposure is deliberately independent from provider configuration. */
@@ -48,6 +52,20 @@ function validBaseUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isHttps(value: string): boolean { return new URL(value).protocol === "https:"; }
+
+function authenticationFromEnvironment(environment: Environment): { authMode?: "bearer"; authToken?: string } | undefined {
+  const mode = environment.OBSERVATORY_AI_AUTH_MODE;
+  const token = environment.OBSERVATORY_AI_AUTH_TOKEN;
+  if (mode === undefined && token === undefined) return {};
+  if (mode !== "bearer" || !validBearerToken(token)) return undefined;
+  return { authMode: "bearer", authToken: token };
+}
+
+function validBearerToken(value: string | undefined): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9._~+\/=:-]{32,512}$/.test(value);
 }
 
 function canonicalBaseUrl(value: string): string {

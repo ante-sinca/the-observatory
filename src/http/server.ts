@@ -6,6 +6,7 @@ import { ProjectRegistry } from "../services/project-registry.js";
 import { ProjectQueryService } from "../services/query.js";
 import { AskProjectService } from "../services/ask-project.js";
 import { ObservatoryAgentService, type AssistantConversationContext } from "../intelligence/agent.js";
+import { AssistantProviderHealthService } from "../intelligence/health.js";
 import { handleMcpRequest, type McpJsonRpcRequest } from "../mcp/server.js";
 import { MCP_READ_SCOPES, oauthMcpConfiguration, oauthScopeForTool, protectedResourceMetadata, verifyOAuthMcpAccessToken, type McpReadScope } from "../mcp/oauth.js";
 import { McpToolError, ObservatoryToolService } from "../mcp/tools.js";
@@ -23,6 +24,8 @@ export interface ObservatoryHttpServices {
   agent?: ObservatoryAgentService;
   /** Browser-only exposure is opt-in even when the optional API is composed. */
   assistantUiEnabled?: boolean;
+  /** Optional, cached provider reachability check; never needed for deterministic reads. */
+  assistantHealth?: AssistantProviderHealthService;
   tools: ObservatoryToolService;
 }
 
@@ -82,6 +85,12 @@ async function route(request: IncomingMessage, response: ServerResponse, service
   if (path === "/mcp") return handleRemoteMcp(request, response, services);
   if (path === "/mcp/tools") return handleLegacyMcpTools(request, response, services);
   if (path === "/mcp/call") return handleLegacyMcpCall(request, response, services);
+  if (path === "/api/assistant/health" && method === "GET") {
+    const health = services.assistantHealth
+      ? await services.assistantHealth.check()
+      : { status: services.agent ? "configured" : "disabled", availability: "unavailable" as const };
+    return send(response, 200, health);
+  }
   if (path === "/api/projects" && method === "GET") return send(response, 200, services.queries.listProjects());
   if (path === "/api/projects" && method === "POST") {
     assertOperator(request);
@@ -624,21 +633,24 @@ function askScreen(slug: string, name: string, projects: ReturnType<ProjectQuery
  * live only in this page's JavaScript memory. The server receives bounded,
  * untrusted linguistic context and always re-grounds a substantive answer.
  */
-function assistantScreen(slug: string, name: string, projects: ReturnType<ProjectQueryService["listProjects"]>, initiallyAvailable: boolean): string {
+function assistantScreen(slug: string, name: string, projects: ReturnType<ProjectQueryService["listProjects"]>, initiallyConfigured: boolean): string {
   const options = projects.map((project) => `<option value="${escapeHtml(project.slug)}"${project.slug === slug ? " selected" : ""}>${escapeHtml(project.name)}</option>`).join("");
   const suggestions = ["Where is this value configured?", "How does this feature work?", "Which tests cover this behaviour?", "Where would I change this safely?", "What changed recently in this area?"];
   const askHref = `/projects/${encodeURIComponent(slug)}/ask`;
-  return `<h1>Assistant — ${escapeHtml(name)}</h1><p class="project-label">Project: <strong>${escapeHtml(name)}</strong></p><p id="assistant-availability" class="${initiallyAvailable ? "notice success" : "notice error"}">Assistant availability: <strong>${initiallyAvailable ? "Available" : "Unavailable"}</strong>${initiallyAvailable ? "" : ". Use Ask Project for deterministic evidence lookup."}</p><p>Conversational, evidence-grounded reasoning for this project. For a deterministic evidence lookup, use <a href="${askHref}">Ask Project</a>.</p><label for="assistant-project">Project selector<select id="assistant-project" aria-label="Project selector">${options}</select></label><section id="assistant-conversation" class="wide conversation" aria-live="polite"></section><form id="assistant-form"><label for="assistant-question">Ask the assistant about ${escapeHtml(name)}<textarea id="assistant-question" name="question" maxlength="2000" required placeholder="Where is this value configured?"></textarea></label><button type="submit">Ask Assistant</button></form><section class="wide"><h2>Suggested questions</h2><p>${suggestions.map((suggestion) => `<button class="suggestion" type="button" data-question="${escapeHtml(suggestion)}">${escapeHtml(suggestion)}</button>`).join("")}</p></section><script>
+  return `<h1>Assistant — ${escapeHtml(name)}</h1><p class="project-label">Project: <strong>${escapeHtml(name)}</strong></p><p id="assistant-availability" class="notice error">Assistant availability: <strong>Assistant temporarily unavailable</strong>${initiallyConfigured ? ". Checking the configured provider." : ". Use Ask Project for deterministic evidence lookup."}</p><p>Conversational, evidence-grounded reasoning for this project. For a deterministic evidence lookup, use <a href="${askHref}">Ask Project</a>.</p><label for="assistant-project">Project selector<select id="assistant-project" aria-label="Project selector">${options}</select></label><section id="assistant-conversation" class="wide conversation" aria-live="polite"></section><form id="assistant-form"><label for="assistant-question">Ask the assistant about ${escapeHtml(name)}<textarea id="assistant-question" name="question" maxlength="2000" required placeholder="Where is this value configured?"></textarea></label><button type="submit">Ask Assistant</button></form><section class="wide"><h2>Suggested questions</h2><p>${suggestions.map((suggestion) => `<button class="suggestion" type="button" data-question="${escapeHtml(suggestion)}">${escapeHtml(suggestion)}</button>`).join("")}</p></section><script>
 (() => {
   const slug=${JSON.stringify(slug)};
   const form=document.querySelector('#assistant-form');
   const input=document.querySelector('#assistant-question');
   const transcript=document.querySelector('#assistant-conversation');
   const selector=document.querySelector('#assistant-project');
+  const availability=document.querySelector('#assistant-availability');
   // Ephemeral, bounded linguistic context only: it is not an evidence cache or
   // persisted conversation. Evidence is fetched again for every answer.
   const context={referencedConcept:'',referencedPaths:[],recentUserMessages:[]};
   const add=(parent,tag,value,className) => { const element=document.createElement(tag); if(className) element.className=className; element.textContent=String(value || ''); parent.appendChild(element); return element; };
+  const setAvailability=(health) => { const available=health && health.availability === 'available'; availability.className=available ? 'notice success' : 'notice error'; availability.replaceChildren(); add(availability,'span','Assistant availability: '); add(availability,'strong',available ? 'Assistant available' : 'Assistant temporarily unavailable'); if(!available) add(availability,'span',' Use Ask Project for deterministic evidence lookup.'); };
+  const refreshAvailability=async () => { try { const response=await fetch('/api/assistant/health',{headers:{'accept':'application/json'}}); const health=await response.json(); setAvailability(response.ok ? health : undefined); } catch { setAvailability(undefined); } };
   const detail=(parent,summary) => { const node=document.createElement('details'); const label=document.createElement('summary'); label.textContent=summary; node.appendChild(label); parent.appendChild(node); return node; };
   const lineLabel=(item) => item.startLine ? 'lines ' + item.startLine + (item.endLine && item.endLine !== item.startLine ? '–' + item.endLine : '') : 'line unavailable';
   const resetConversation=() => { context.referencedConcept=''; context.referencedPaths=[]; context.recentUserMessages=[]; transcript.replaceChildren(); const welcome=document.createElement('article'); add(welcome,'strong','Observatory Assistant'); add(welcome,'p','Each answer is freshly grounded in this project’s current indexed evidence. Conversation context is limited to follow-up wording and is never stored.'); transcript.appendChild(welcome); };
@@ -652,8 +664,9 @@ function assistantScreen(slug: string, name: string, projects: ReturnType<Projec
   const render=(data) => { const entry=document.createElement('article'); entry.className='wide assistant-answer'; add(entry,'strong','Observatory Assistant'); if(data.availability === 'unavailable') add(entry,'p','Assistant reasoning is currently unavailable. Deterministic Observatory evidence, when present, is shown below.','notice error'); add(entry,'p',data.answer || 'No assistant answer was returned.'); const metadata=document.createElement('dl'); const status=add(metadata,'dd',data.status || 'unavailable','badge'); const statusLabel=document.createElement('dt'); statusLabel.textContent='Evidence status'; metadata.insertBefore(statusLabel,status); const sufficiency=add(metadata,'dd',data.answerSufficiency || 'insufficient','badge'); const sufficiencyLabel=document.createElement('dt'); sufficiencyLabel.textContent='Answer sufficiency'; metadata.insertBefore(sufficiencyLabel,sufficiency); const revision=add(metadata,'dd',data.revision || 'Unavailable'); const revisionLabel=document.createElement('dt'); revisionLabel.textContent='Repository revision'; metadata.insertBefore(revisionLabel,revision); entry.appendChild(metadata); showEvidence(entry,Array.isArray(data.evidence) ? data.evidence : []); showToolCalls(entry,Array.isArray(data.toolCalls) ? data.toolCalls : []); transcript.appendChild(entry); };
   selector.addEventListener('change', () => { resetConversation(); window.location.assign('/projects/' + encodeURIComponent(selector.value) + '/assistant'); });
   document.querySelectorAll('[data-question]').forEach((button) => button.addEventListener('click', () => { input.value=button.dataset.question || ''; input.focus(); }));
-  form.addEventListener('submit', async (event) => { event.preventDefault(); const question=input.value.trim(); if(!question) return; const user=document.createElement('article'); user.className='wide assistant-question'; add(user,'strong','You'); add(user,'p',question); transcript.appendChild(user); input.value=''; const pending=document.createElement('article'); pending.className='wide muted'; add(pending,'p','Grounding a fresh answer in the current indexed evidence…'); transcript.appendChild(pending); try { const response=await fetch('/api/projects/' + encodeURIComponent(slug) + '/assistant',{method:'POST',headers:{'content-type':'application/json','accept':'application/json'},body:JSON.stringify({question,conversation:{referencedConcept:context.referencedConcept,referencedPaths:context.referencedPaths.slice(0,6),recentUserMessages:context.recentUserMessages.slice(-4)}})}); const data=await response.json(); pending.remove(); if(!response.ok && !data.answer) throw new Error(data.error || 'Assistant request failed.'); remember(question,data); render(data); } catch(error) { pending.remove(); const failure=document.createElement('article'); failure.className='wide notice error'; add(failure,'strong','Assistant unavailable'); add(failure,'p',error instanceof Error ? error.message : 'Assistant request failed. Use Ask Project for deterministic evidence lookup.'); const link=document.createElement('a'); link.href=${JSON.stringify(askHref)}; link.textContent='Open Ask Project'; failure.appendChild(link); transcript.appendChild(failure); } });
+  form.addEventListener('submit', async (event) => { event.preventDefault(); const question=input.value.trim(); if(!question) return; const user=document.createElement('article'); user.className='wide assistant-question'; add(user,'strong','You'); add(user,'p',question); transcript.appendChild(user); input.value=''; const pending=document.createElement('article'); pending.className='wide muted'; add(pending,'p','Grounding a fresh answer in the current indexed evidence…'); transcript.appendChild(pending); try { const response=await fetch('/api/projects/' + encodeURIComponent(slug) + '/assistant',{method:'POST',headers:{'content-type':'application/json','accept':'application/json'},body:JSON.stringify({question,conversation:{referencedConcept:context.referencedConcept,referencedPaths:context.referencedPaths.slice(0,6),recentUserMessages:context.recentUserMessages.slice(-4)}})}); const data=await response.json(); pending.remove(); if(!response.ok && !data.answer) throw new Error(data.error || 'Assistant request failed.'); setAvailability(data); remember(question,data); render(data); } catch(error) { pending.remove(); setAvailability(undefined); const failure=document.createElement('article'); failure.className='wide notice error'; add(failure,'strong','Assistant unavailable'); add(failure,'p',error instanceof Error ? error.message : 'Assistant request failed. Use Ask Project for deterministic evidence lookup.'); const link=document.createElement('a'); link.href=${JSON.stringify(askHref)}; link.textContent='Open Ask Project'; failure.appendChild(link); transcript.appendChild(failure); } });
   resetConversation();
+  void refreshAvailability();
 })();
 </script>`;
 }

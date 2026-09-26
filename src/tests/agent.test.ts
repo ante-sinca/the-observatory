@@ -7,7 +7,8 @@ import { ConfigCipher } from "../core/security.js";
 import type { Conflict, KnowledgeItem, Project, Snapshot, SourceArtifact } from "../domain/types.js";
 import { createHttpServer } from "../http/server.js";
 import { ObservatoryAgentService } from "../intelligence/agent.js";
-import { assistantUiEnabledFromEnvironment, intelligenceConfigFromEnvironment } from "../intelligence/config.js";
+import { assistantUiEnabledFromEnvironment, intelligenceConfigFromEnvironment, type IntelligenceConfig } from "../intelligence/config.js";
+import { AssistantProviderHealthService } from "../intelligence/health.js";
 import { OllamaProvider } from "../intelligence/ollama.js";
 import { IntelligenceProviderError, type IntelligenceCompletion, type IntelligenceCompletionRequest, type IntelligenceProvider } from "../intelligence/provider.js";
 import { classifyAssistantQuestion, evaluateAnswerSufficiency } from "../intelligence/sufficiency.js";
@@ -101,6 +102,14 @@ test("AI configuration is opt-in and malformed settings fail closed", () => {
   assert.equal(assistantUiEnabledFromEnvironment({}), false);
   assert.equal(assistantUiEnabledFromEnvironment({ OBSERVATORY_ASSISTANT_UI_ENABLED: "true" }), true);
   assert.equal(assistantUiEnabledFromEnvironment({ OBSERVATORY_ASSISTANT_UI_ENABLED: "TRUE" }), false);
+  assert.deepEqual(intelligenceConfigFromEnvironment({ NODE_ENV: "production", OBSERVATORY_AI_ENABLED: "true", OBSERVATORY_AI_PROVIDER: "ollama", OBSERVATORY_AI_MODEL: "qwen2.5:7b", OBSERVATORY_AI_BASE_URL: "http://127.0.0.1:11434" }), { enabled: false, reason: "invalid_configuration" });
+  const remote = intelligenceConfigFromEnvironment({ NODE_ENV: "production", OBSERVATORY_AI_ENABLED: "true", OBSERVATORY_AI_PROVIDER: "ollama", OBSERVATORY_AI_MODEL: "qwen2.5:7b", OBSERVATORY_AI_BASE_URL: "https://inference.example.test", OBSERVATORY_AI_AUTH_MODE: "bearer", OBSERVATORY_AI_AUTH_TOKEN: "a".repeat(48) });
+  assert.equal(remote.enabled, true);
+  assert.equal(remote.authMode, "bearer");
+  assert.equal(remote.authToken?.length, 48);
+  assert.deepEqual(intelligenceConfigFromEnvironment({ OBSERVATORY_AI_ENABLED: "true", OBSERVATORY_AI_PROVIDER: "ollama", OBSERVATORY_AI_MODEL: "qwen2.5:7b", OBSERVATORY_AI_AUTH_MODE: "bearer", OBSERVATORY_AI_AUTH_TOKEN: "short" }), { enabled: false, reason: "invalid_configuration" });
+  assert.deepEqual(intelligenceConfigFromEnvironment({ OBSERVATORY_AI_ENABLED: "true", OBSERVATORY_AI_PROVIDER: "ollama", OBSERVATORY_AI_MODEL: "qwen2.5:7b", OBSERVATORY_AI_BASE_URL: "https://user:pass@inference.example.test" }), { enabled: false, reason: "invalid_configuration" });
+  assert.deepEqual(intelligenceConfigFromEnvironment({ OBSERVATORY_AI_ENABLED: "true", OBSERVATORY_AI_PROVIDER: "ollama", OBSERVATORY_AI_MODEL: "qwen2.5:7b", OBSERVATORY_AI_BASE_URL: "https://inference.example.test?token=not-allowed" }), { enabled: false, reason: "invalid_configuration" });
 });
 
 test("OllamaProvider converts valid completions and tool calls without leaking vendor types", async () => {
@@ -116,6 +125,32 @@ test("OllamaProvider converts valid completions and tool calls without leaking v
   assert.match(body, /qwen2\.5:7b/);
 });
 
+test("OllamaProvider applies optional bearer authentication without exposing it", async () => {
+  let authorization: string | null = null;
+  let redirect: RequestRedirect | undefined;
+  const provider = new OllamaProvider({
+    baseUrl: "https://inference.example.test",
+    timeoutMs: 500,
+    bearerToken: "b".repeat(48),
+    fetchImplementation: async (_input, init) => {
+      authorization = new Headers(init?.headers).get("authorization");
+      redirect = init?.redirect;
+      return Response.json({ message: { role: "assistant", content: "Grounded answer." } });
+    },
+  });
+  await provider.complete({ model: "qwen2.5:7b", messages: [{ role: "user", content: "hello" }] });
+  assert.equal(authorization, `Bearer ${"b".repeat(48)}`);
+  assert.equal(redirect, "error");
+
+  let localAuthorization: string | null = "unexpected";
+  const local = new OllamaProvider({ baseUrl: "http://127.0.0.1:11434", timeoutMs: 500, fetchImplementation: async (_input, init) => {
+    localAuthorization = new Headers(init?.headers).get("authorization");
+    return Response.json({ message: { role: "assistant", content: "Local answer." } });
+  } });
+  await local.complete({ model: "qwen2.5:7b", messages: [{ role: "user", content: "hello" }] });
+  assert.equal(localAuthorization, null);
+});
+
 test("OllamaProvider handles malformed, unavailable, and timed-out responses", async () => {
   const malformed = new OllamaProvider({ baseUrl: "http://localhost:11434", timeoutMs: 500, fetchImplementation: async () => Response.json({ message: { role: "assistant", content: 3 } }) });
   await assert.rejects(() => malformed.complete({ model: "qwen", messages: [{ role: "user", content: "x" }] }), (error: unknown) => error instanceof IntelligenceProviderError && error.code === "malformed_response");
@@ -128,6 +163,45 @@ test("OllamaProvider handles malformed, unavailable, and timed-out responses", a
 
   const timeout = new OllamaProvider({ baseUrl: "http://localhost:11434", timeoutMs: 100, fetchImplementation: async (_input, init) => new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })))) });
   await assert.rejects(() => timeout.complete({ model: "qwen", messages: [{ role: "user", content: "x" }] }), (error: unknown) => error instanceof IntelligenceProviderError && error.code === "timeout");
+});
+
+test("OllamaProvider classifies remote auth and health failures without returning endpoint secrets", async () => {
+  const secret = "c".repeat(48);
+  const unauthorized = new OllamaProvider({ baseUrl: "https://inference.example.test", timeoutMs: 500, bearerToken: secret, fetchImplementation: async () => new Response("denied", { status: 401 }) });
+  await assert.rejects(() => unauthorized.complete({ model: "qwen", messages: [{ role: "user", content: "x" }] }), (error: unknown) => error instanceof IntelligenceProviderError && error.code === "unauthorized" && !error.message.includes(secret));
+
+  const forbidden = new OllamaProvider({ baseUrl: "https://inference.example.test", timeoutMs: 500, bearerToken: secret, fetchImplementation: async () => new Response("denied", { status: 403 }) });
+  await assert.rejects(() => forbidden.health(), (error: unknown) => error instanceof IntelligenceProviderError && error.code === "unauthorized" && !error.message.includes(secret));
+
+  const reachable = new OllamaProvider({ baseUrl: "https://inference.example.test", timeoutMs: 500, fetchImplementation: async () => Response.json({ version: "0.9.0" }) });
+  await reachable.health();
+  const malformed = new OllamaProvider({ baseUrl: "https://inference.example.test", timeoutMs: 500, fetchImplementation: async () => Response.json({ version: 3 }) });
+  await assert.rejects(() => malformed.health(), (error: unknown) => error instanceof IntelligenceProviderError && error.code === "malformed_response");
+  const serverFailure = new OllamaProvider({ baseUrl: "https://inference.example.test", timeoutMs: 500, fetchImplementation: async () => new Response("upstream failure", { status: 503 }) });
+  await assert.rejects(() => serverFailure.health(), (error: unknown) => error instanceof IntelligenceProviderError && error.code === "unavailable");
+  const tlsLikeFailure = new OllamaProvider({ baseUrl: "https://inference.example.test", timeoutMs: 500, fetchImplementation: async () => { throw new TypeError("certificate verify failed"); } });
+  await assert.rejects(() => tlsLikeFailure.health(), (error: unknown) => error instanceof IntelligenceProviderError && error.code === "unavailable");
+});
+
+test("provider health is cached, safe, and separate from deterministic services", async () => {
+  const enabled: IntelligenceConfig = { enabled: true, provider: "ollama", model: "qwen2.5:7b", baseUrl: "https://inference.example.test", timeoutMs: 500 };
+  let now = 100;
+  let calls = 0;
+  const reachable = new AssistantProviderHealthService(enabled, { complete: async () => response("unused"), health: async () => { calls += 1; } }, 1_000, () => now);
+  assert.deepEqual(await reachable.check(), { status: "reachable", availability: "available", provider: "ollama", model: "qwen2.5:7b", latencyMs: 0 });
+  now += 100;
+  assert.equal((await reachable.check()).status, "reachable");
+  assert.equal(calls, 1);
+  const disabled = new AssistantProviderHealthService({ enabled: false, reason: "disabled" });
+  assert.deepEqual(await disabled.check(), { status: "disabled", availability: "unavailable" });
+  const unauthorized = new AssistantProviderHealthService(enabled, { complete: async () => response("unused"), health: async () => { throw new IntelligenceProviderError("unauthorized"); } });
+  assert.equal((await unauthorized.check()).status, "unauthorized");
+  const unavailable = new AssistantProviderHealthService(enabled, { complete: async () => response("unused"), health: async () => { throw new IntelligenceProviderError("unavailable"); } });
+  assert.equal((await unavailable.check()).status, "unavailable");
+  const timeout = new AssistantProviderHealthService(enabled, { complete: async () => response("unused"), health: async () => { throw new IntelligenceProviderError("timeout"); } });
+  assert.equal((await timeout.check()).status, "timeout");
+  const configured = new AssistantProviderHealthService(enabled, { complete: async () => response("unused") });
+  assert.equal((await configured.check()).status, "configured");
 });
 
 test("agent preserves deterministic provenance and executes only registered read-only tools", async () => {
@@ -155,6 +229,11 @@ test("unknown tools, malformed provider calls, and tool-loop limits return contr
   const invalid = new ScriptedProvider([new IntelligenceProviderError("invalid_tool_call")]);
   const invalidResult = await agent(invalid).agent.answer("observed", "Where is the release flag configured?");
   assert.equal(invalidResult.availability, "unavailable");
+
+  const unauthorized = new ScriptedProvider([new IntelligenceProviderError("unauthorized")]);
+  const unauthorizedResult = await agent(unauthorized).agent.answer("observed", "Where is the release flag configured?");
+  assert.equal(unauthorizedResult.availability, "unavailable");
+  assert.doesNotMatch(unauthorizedResult.answer, /unauthorized|401|403/i);
 
   const limited = new ScriptedProvider([response("", [
     { id: "call-1", name: "get_current_snapshot", arguments: {} },
@@ -266,6 +345,9 @@ test("disabled assistant endpoint is controlled and leaves Ask Project unchanged
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   try {
+    const health = await fetch(`${origin}/api/assistant/health`);
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { status: "disabled", availability: "unavailable" });
     const disabled = await fetch(`${origin}/api/projects/observed/assistant`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: "Where is the release flag configured?" }) });
     assert.equal(disabled.status, 503);
     const disabledBody = await disabled.json() as { availability: string; answerSufficiency: string };
@@ -288,12 +370,19 @@ test("configured assistant endpoint returns the grounded structured contract", a
     queries,
     ask,
     agent: new ObservatoryAgentService(provider, queries, ask, { model: "qwen2.5:7b" }),
+    assistantHealth: new AssistantProviderHealthService({ enabled: true, provider: "ollama", model: "qwen2.5:7b", baseUrl: "https://inference.example.test", timeoutMs: 500, authMode: "bearer", authToken: "d".repeat(48) }, { complete: async () => response("unused"), health: async () => undefined }),
     tools: new ObservatoryToolService(queries, ask),
   };
   const server = createHttpServer(services);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   try {
+    const health = await fetch(`${origin}/api/assistant/health`);
+    assert.equal(health.status, 200);
+    const healthText = await health.text();
+    assert.match(healthText, /"status":"reachable"/);
+    assert.match(healthText, /"provider":"ollama"/);
+    assert.doesNotMatch(healthText, /inference\.example|d{48}|authToken|baseUrl/);
     const result = await fetch(`${origin}/api/projects/observed/assistant`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: "Where is the release flag configured?", conversation: { referencedConcept: "release flag", referencedPaths: ["src/config/release-flags.ts"], recentUserMessages: ["Where is the release flag configured?"] } }) });
     assert.equal(result.status, 200);
     const body = await result.json() as { status: string; answerSufficiency: string; project: string; revision?: string; evidence: unknown[]; toolCalls: unknown[] };
@@ -346,7 +435,9 @@ test("assistant page is opt-in, distinguishes Ask Project, and safely renders st
     const html = await page.text();
     assert.match(html, /href="\/projects\/observed\/ask">Ask<\/a>/);
     assert.match(html, /href="\/projects\/observed\/assistant">Assistant<\/a>/);
-    assert.match(html, /Assistant availability: <strong>Available<\/strong>/);
+    assert.match(html, /Assistant availability: <strong>Assistant temporarily unavailable<\/strong>/);
+    assert.match(html, /api\/assistant\/health/);
+    assert.match(html, /refreshAvailability/);
     assert.match(html, /Evidence status/);
     assert.match(html, /Answer sufficiency/);
     assert.match(html, /resetConversation/);

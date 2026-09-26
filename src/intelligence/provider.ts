@@ -35,9 +35,11 @@ export interface IntelligenceCompletion {
 /** A completion-only seam. Application services never depend on a vendor SDK. */
 export interface IntelligenceProvider {
   complete(request: IntelligenceCompletionRequest): Promise<IntelligenceCompletion>;
+  /** Optional so existing deterministic test seams do not need a live provider. */
+  health?(): Promise<void>;
 }
 
-export type IntelligenceProviderErrorCode = "unavailable" | "timeout" | "malformed_response" | "invalid_tool_call";
+export type IntelligenceProviderErrorCode = "unavailable" | "unauthorized" | "timeout" | "malformed_response" | "invalid_tool_call";
 
 /** Deliberately stable, non-sensitive errors suitable for controlled responses. */
 export class IntelligenceProviderError extends Error {

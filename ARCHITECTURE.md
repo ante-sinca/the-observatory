@@ -1,4 +1,4 @@
-# Architecture — Project Observatory v0.2B
+# Architecture — Project Observatory v0.2C
 
 ## Components
 
@@ -79,8 +79,10 @@ repository/provider evidence
 
 `IntelligenceProvider` accepts structured system/user/tool messages, tool
 definitions, a configured model, and returns an assistant completion or tool
-calls. `OllamaProvider` is its first adapter, using Ollama's local `/api/chat`
-endpoint and Qwen-compatible models. Application services only depend on the
+calls. `OllamaProvider` is its first adapter, using Ollama's `/api/chat`
+endpoint and Qwen-compatible models. It supports the unauthenticated local
+loopback default for development and an optional server-side bearer token for a
+protected remote HTTPS endpoint. Application services only depend on the
 provider-neutral contract, so another provider can be added as a new adapter
 and composed in `src/index.ts`; it must not be imported by query, ingestion, or
 snapshot services.
@@ -97,6 +99,23 @@ The agent has bounded tool iterations, calls, evidence context, output excerpts,
 and provider timeout. Disabled, malformed, unreachable, timed-out, malformed,
 or invalid-tool provider interactions produce a controlled response without
 changing ingestion, HTTP reads, browser pages, MCP, or `AskProjectService`.
+
+### Remote provider health and OCI boundary
+
+`AssistantProviderHealthService` is a narrow, cached (15-second) server-side
+reachability check. It calls only Ollama `GET /api/version` and reports safe
+categories: `disabled`, `configured`, `reachable`, `unauthorized`,
+`unavailable`, `timeout`, or `malformed_response`. The browser can consume
+`GET /api/assistant/health` to update its Assistant indicator, but the result
+contains no endpoint URL, token, prompt, or evidence and never affects
+deterministic services.
+
+For production, Vercel calls a separately operated OCI inference host through
+HTTPS with a server-side bearer token. A reverse proxy verifies the token and
+proxies only `POST /api/chat` and `GET /api/version` to Ollama loopback. The
+OCI host is an optional downstream dependency, not an Observatory deployment
+target; its availability cannot block refresh, snapshots, queries, Ask Project,
+or MCP. The versioned operator package is under `deploy/oci-ollama/`.
 
 ### Answer sufficiency and value tracing
 
