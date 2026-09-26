@@ -153,12 +153,47 @@ model-supplied percentage or amount as evidence.
 ### Durable runtime and Vercel
 
 `POSTGRES_URL` is the provider-managed pooled Vercel/Neon runtime variable.
-`POSTGRES_URL_NON_POOLING` is reserved for the guarded migration runner. Source configurations are encrypted before they are persisted; they
-are decrypted only while building the registered read-only adapter. The
-PostgreSQL store hydrates all canonical state at process start, and browser,
-HTTP, and MCP use the same query and `AskProjectService` layer over that store.
-`api/index.ts` is a thin Vercel function adapter; the stdio MCP process remains
-a local/server runtime.
+`POSTGRES_URL_NON_POOLING` is reserved for the guarded migration runner. Source
+configurations are encrypted before they are persisted and decrypted only while
+building a registered read-only adapter.
+
+v0.2D uses a targeted durable-read boundary for PostgreSQL/Vercel requests.
+Cold starts do not hydrate Observatory state, and the Vercel adapter does not
+reload it before a request. Each read queries current canonical PostgreSQL rows
+for the requested project, snapshot, movements, conflicts, or knowledge. This
+preserves cross-instance consistency without relying on sticky process memory.
+
+Artifact metadata is distinct from artifact text. Project lists, project state,
+health checks, browser pages, normal MCP reads, and knowledge search never
+select repository artifact bodies. Ask Project and Assistant value tracing load
+only project-scoped, current-revision bounded candidates; explicit evidence and
+file-excerpt calls use an artifact ID or exact path. Returned candidate text is
+capped to 32 KiB before line/excerpt selection. Snapshot and history lists are
+bounded (100 and 50 records respectively); explicit snapshot lookup remains
+available by ID.
+
+Set `OBSERVATORY_DB_DIAGNOSTICS=true` temporarily to emit safe read summaries
+such as `db_read category=project_summary rows=4 approx_bytes=2100
+artifact_content=false`. Diagnostics never print SQL parameters, credentials,
+prompts, or artifact text. Use it only for concise operational diagnosis.
+
+The existing array-backed full hydration remains on operator mutation/refresh
+paths so the deterministic write pipeline stays compatible. Optimizing those
+full-state writes into deltas is a v0.2E candidate; it is not used by ordinary
+reads. `api/index.ts` remains a thin Vercel function adapter; the stdio MCP
+process remains a local/server runtime.
+
+### Neon Free post-deployment check
+
+1. Deploy v0.2D without changing OCI/Qwen settings.
+2. Observe Neon transfer, browse `/`, `/projects`, and a project overview.
+3. Run Ask Project (and optionally Assistant) for a normal question such as
+   “How much is the platform fee?”.
+4. If needed, briefly enable `OBSERVATORY_DB_DIAGNOSTICS=true` and confirm
+   summary/state reads have `artifact_content=false`; evidence reads should be
+   bounded and explicitly categorised.
+5. Compare the Neon transfer trend with the prior deployment. Savings depend
+   on production data and traffic and are not guaranteed until measured.
 
 ### Secure remote MCP / ChatGPT
 

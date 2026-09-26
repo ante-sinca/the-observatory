@@ -28,6 +28,25 @@ administration remain separate HTTP-only operations protected by
 - `POST /api/projects/:projectId/assistant`
 - `GET /api/assistant/health`
 
+### Durable-read limits
+
+On PostgreSQL/Vercel, every normal read is a current, targeted query rather
+than a reload of the Observatory process state. `GET /health` and
+`GET /api/assistant/health` make zero Observatory database reads. Project
+lists use aggregate summaries; project state reads one latest snapshot, up to
+20 recent movements, and up to 100 open conflicts. Snapshot lists default to
+50 (maximum 100), knowledge/history lists to 100, and movement/deployment
+lists to 100. These limits do not delete history; explicit snapshot lookup and
+`since` movement lookup remain available.
+
+Repository artifact bodies are not read by project lists, state, search, or
+ordinary MCP calls. `get_evidence`, `get_file_excerpt`, Ask Project, and
+Assistant value tracing use only project-scoped bounded evidence retrieval.
+The latter searches at most 50 current safe artifact candidates and receives
+at most 32 KiB per candidate before producing line-level evidence. This is an
+egress optimization and does not change provenance, snapshot, isolation, or
+answer-sufficiency semantics.
+
 `POST /api/projects/:projectId/ask` accepts `{ "question": "..." }` and is
 the same `AskProjectService` used by MCP. It is bounded to 2,000 question
 characters and returns an evidence-backed answer, current repository revision,

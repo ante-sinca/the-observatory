@@ -9,6 +9,8 @@ import { runMcpStdioServer } from "./mcp/server.js";
 import { ObservatoryToolService } from "./mcp/tools.js";
 import { ProjectRegistry } from "./services/project-registry.js";
 import { ProjectQueryService } from "./services/query.js";
+import { MemoryReadService } from "./services/read-service.js";
+import { PostgresReadService } from "./services/postgres-read-service.js";
 import { AskProjectService } from "./services/ask-project.js";
 import { AdapterRegistry, RefreshOrchestrator } from "./services/refresh.js";
 import { ObservatoryAgentService } from "./intelligence/agent.js";
@@ -24,7 +26,11 @@ export async function createObservatory(options: { store?: ObservatoryStore; int
   const adapters = new AdapterRegistry().registerRepository(new FilesystemAdapter()).registerRepository(new GitHubAdapter()).registerDeployment(new VercelAdapter());
   const registry = new ProjectRegistry(store, cipher);
   const refresh = new RefreshOrchestrator(store, adapters);
-  const queries = new ProjectQueryService(store);
+  const memoryQueries = new ProjectQueryService(store);
+  // PostgreSQL reads are request-scoped, parameterized queries. The legacy
+  // synchronous query service remains behind MemoryReadService for tests,
+  // local development, and the existing deterministic mutation pipeline.
+  const queries = store instanceof PostgresStore ? new PostgresReadService(store) : new MemoryReadService(memoryQueries);
   const ask = new AskProjectService(store, queries);
   const intelligence = intelligenceConfigFromEnvironment();
   const assistantUiEnabled = assistantUiEnabledFromEnvironment();
@@ -37,7 +43,7 @@ export async function createObservatory(options: { store?: ObservatoryStore; int
   const tools = new ObservatoryToolService(queries, ask);
   const stdioTools = new ObservatoryToolService(queries, ask, "local");
   const assistantHealth = new AssistantProviderHealthService(intelligence, provider);
-  return { store, adapters, registry, refresh, queries, ask, agent, intelligence, assistantUiEnabled, assistantHealth, tools, stdioTools };
+  return { store, adapters, registry, refresh, queries, memoryQueries, ask, agent, intelligence, assistantUiEnabled, assistantHealth, tools, stdioTools };
 }
 
 if (process.argv[1] && new URL(`file://${process.argv[1].replaceAll("\\", "/")}`).href === import.meta.url) {

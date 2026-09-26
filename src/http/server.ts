@@ -3,7 +3,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { ConfigCipher, sha256 } from "../core/security.js";
 import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
 import { ProjectRegistry } from "../services/project-registry.js";
-import { ProjectQueryService } from "../services/query.js";
+import type { OnboardingSummary, ProjectSummary } from "../services/query.js";
+import { asReadService, type ObservatoryReadInput, type ObservatoryReadService } from "../services/read-service.js";
 import { AskProjectService } from "../services/ask-project.js";
 import { ObservatoryAgentService, type AssistantConversationContext } from "../intelligence/agent.js";
 import { AssistantProviderHealthService } from "../intelligence/health.js";
@@ -18,7 +19,7 @@ export interface ObservatoryHttpServices {
   store?: ObservatoryStore;
   registry: ProjectRegistry;
   refresh: RefreshOrchestrator;
-  queries: ProjectQueryService;
+  queries: ObservatoryReadInput;
   ask: AskProjectService;
   /** Optional: AI is deliberately absent when disabled or misconfigured. */
   agent?: ObservatoryAgentService;
@@ -38,7 +39,7 @@ export function createHttpServer(services: ObservatoryHttpServices): Server {
 /** Usable from Node's long-lived server and Vercel's one-invocation handler. */
 export async function handleHttpRequest(request: IncomingMessage, response: ServerResponse, services: ObservatoryHttpServices): Promise<void> {
   try {
-    await route(request, response, services);
+    await route(request, response, { ...services, queries: asReadService(services.queries) });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unexpected server error.";
     const status = /not found/i.test(message) ? 404 : /must|required|already exists|unsupported|too large/i.test(message) ? 400 : 500;
@@ -47,13 +48,15 @@ export async function handleHttpRequest(request: IncomingMessage, response: Serv
   }
 }
 
-async function route(request: IncomingMessage, response: ServerResponse, services: ObservatoryHttpServices): Promise<void> {
+type ResolvedHttpServices = Omit<ObservatoryHttpServices, "queries"> & { queries: ObservatoryReadService };
+
+async function route(request: IncomingMessage, response: ServerResponse, services: ResolvedHttpServices): Promise<void> {
   const method = request.method ?? "GET";
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
   const path = url.pathname.replace(/\/$/, "") || "/";
   if (method === "GET" && path === "/health") return send(response, 200, { status: "ok", service: "project-observatory", version: "0.1.0" });
   if (method === "GET" && path === "/.well-known/oauth-protected-resource") return sendProtectedResourceMetadata(request, response);
-  if (method === "GET" && path === "/") return sendHtml(response, dashboard(services.queries.listProjects()));
+  if (method === "GET" && path === "/") return sendHtml(response, dashboard(await services.queries.listProjects()));
   const browserSegments = path.split("/").filter(Boolean).map(decodeURIComponent);
   if (method === "GET" && path === "/projects/new") {
     const csrf = issueCsrfToken(request);
@@ -63,7 +66,7 @@ async function route(request: IncomingMessage, response: ServerResponse, service
   if (method === "POST" && path === "/projects/new/auth") return authenticateOnboardingOperator(request, response);
   if (method === "POST" && path === "/projects/new/test") return testOnboardingConnection(request, response, services);
   if (method === "POST" && path === "/projects/new/create") return createOnboardedProject(request, response, services);
-  if (method === "GET" && path === "/projects") return sendHtml(response, projectsIndex(services.queries.listProjects()));
+  if (method === "GET" && path === "/projects") return sendHtml(response, projectsIndex(await services.queries.listProjects()));
   if (method === "POST" && browserSegments[0] === "projects" && browserSegments[1] && browserSegments[2] === "sources" && browserSegments[3] && browserSegments[4] === "test" && browserSegments.length === 5) {
     return testExistingSource(request, response, services, browserSegments[1], browserSegments[3]);
   }
@@ -77,10 +80,10 @@ async function route(request: IncomingMessage, response: ServerResponse, service
     const page = browserSegments[2] ?? "overview";
     const csrf = issueCsrfToken(request);
     if (page === "assistant" && !services.assistantUiEnabled) {
-      const project = services.queries.getProject(browserSegments[1]);
+      const project = await services.queries.getProject(browserSegments[1]);
       return sendHtml(response, assistantUnavailableScreen(project.slug, project.name), 503, csrf.headers);
     }
-    return sendHtml(response, projectScreen(services, browserSegments[1], page, url.searchParams.get("onboarding") === "complete", csrf.token, hasOnboardingOperatorAccess(request)), 200, csrf.headers);
+    return sendHtml(response, await projectScreen(services, browserSegments[1], page, url.searchParams.get("onboarding") === "complete", csrf.token, hasOnboardingOperatorAccess(request)), 200, csrf.headers);
   }
   if (path === "/mcp") return handleRemoteMcp(request, response, services);
   if (path === "/mcp/tools") return handleLegacyMcpTools(request, response, services);
@@ -91,9 +94,10 @@ async function route(request: IncomingMessage, response: ServerResponse, service
       : { status: services.agent ? "configured" : "disabled", availability: "unavailable" as const };
     return send(response, 200, health);
   }
-  if (path === "/api/projects" && method === "GET") return send(response, 200, services.queries.listProjects());
+  if (path === "/api/projects" && method === "GET") return send(response, 200, await services.queries.listProjects());
   if (path === "/api/projects" && method === "POST") {
     assertOperator(request);
+    await hydrateForMutation(services);
     const body = await jsonBody(request);
     return send(response, 201, await services.registry.createProject({ slug: stringField(body, "slug"), name: stringField(body, "name"), description: optionalStringField(body, "description") }, actor(request)));
   }
@@ -103,13 +107,14 @@ async function route(request: IncomingMessage, response: ServerResponse, service
     return send(response, 404, { error: "Route not found." });
   }
   const projectRef = segments[2];
-  if (segments.length === 3 && method === "GET") return send(response, 200, services.queries.getProjectState(projectRef));
+  if (segments.length === 3 && method === "GET") return send(response, 200, await services.queries.getProjectState(projectRef));
   if (segments.length === 3 && method === "PATCH") {
     assertOperator(request);
+    await hydrateForMutation(services);
     const body = await jsonBody(request);
-    return send(response, 200, await services.registry.updateProject(services.queries.getProject(projectRef).id, { name: optionalStringField(body, "name"), description: optionalStringField(body, "description") }, actor(request)));
+    return send(response, 200, await services.registry.updateProject((await services.queries.getProject(projectRef)).id, { name: optionalStringField(body, "name"), description: optionalStringField(body, "description") }, actor(request)));
   }
-  const projectId = services.queries.getProject(projectRef).id;
+  const projectId = (await services.queries.getProject(projectRef)).id;
   const resource = segments[3];
   if (resource === "ask" && method === "POST" && segments.length === 4) {
     const body = await jsonBody(request, 12_000);
@@ -119,7 +124,7 @@ async function route(request: IncomingMessage, response: ServerResponse, service
     const body = await jsonBody(request, 12_000);
     const question = assistantQuestion(body);
     if (!services.agent) {
-      const project = services.queries.getProject(projectId);
+      const project = await services.queries.getProject(projectId);
       return send(response, 503, {
         answer: "The Observatory assistant is not available. Deterministic Ask Project remains available.",
         status: "insufficient_evidence",
@@ -133,9 +138,10 @@ async function route(request: IncomingMessage, response: ServerResponse, service
     const result = await services.agent.answer(projectId, question, assistantConversation(body));
     return send(response, result.availability === "available" ? 200 : 503, result);
   }
-  if (resource === "sources" && method === "GET" && segments.length === 4) return send(response, 200, services.registry.getSources(projectId).map(publicSource));
+  if (resource === "sources" && method === "GET" && segments.length === 4) return send(response, 200, (await services.queries.getSources(projectId)).map(publicSource));
   if (resource === "sources" && method === "POST" && segments.length === 4) {
     assertOperator(request);
+    await hydrateForMutation(services);
     const body = await jsonBody(request);
     const type = stringField(body, "type");
     if (type !== "repository" && type !== "deployment") throw new Error("'type' must be repository or deployment.");
@@ -143,22 +149,24 @@ async function route(request: IncomingMessage, response: ServerResponse, service
   }
   if (resource === "sources" && segments[4] && segments[5] === "health" && method === "POST") {
     assertOperator(request);
+    await hydrateForMutation(services);
     return send(response, 200, await services.refresh.checkSource(projectId, segments[4]));
   }
   if (resource === "refresh" && method === "POST") {
     assertOperator(request);
+    await hydrateForMutation(services);
     return send(response, 202, await services.refresh.refresh(projectId));
   }
-  if (resource === "refresh-runs" && method === "GET") return send(response, 200, services.queries.getRefreshRuns(projectId));
-  if (resource === "state" && method === "GET") return send(response, 200, services.queries.getProjectState(projectId));
-  if (resource === "snapshots" && method === "GET" && segments.length === 4) return send(response, 200, services.queries.getSnapshots(projectId));
-  if (resource === "snapshots" && method === "GET" && segments[4]) return send(response, 200, services.queries.getSnapshot(projectId, segments[4]));
-  if (resource === "movements" && method === "GET") return send(response, 200, services.queries.getRecentChanges(projectId, url.searchParams.get("since") ?? undefined));
-  if (resource === "conflicts" && method === "GET") return send(response, 200, services.queries.getConflicts(projectId));
-  if (resource === "knowledge" && method === "GET" && segments.length === 4) return send(response, 200, services.queries.getKnowledge(projectId));
-  if (resource === "knowledge" && method === "GET" && segments[4]) return send(response, 200, services.queries.getKnowledge(projectId, segments[4]));
-  if (resource === "search" && method === "GET") return send(response, 200, services.queries.searchProject(projectId, url.searchParams.get("q") ?? "", { domain: url.searchParams.get("domain") ?? undefined, type: url.searchParams.get("type") as import("../domain/types.js").KnowledgeType | undefined, limit: numberQuery(url, "limit") }));
-  if (resource === "deployments" && method === "GET") return send(response, 200, services.queries.getDeployments(projectId, url.searchParams.get("environment") ?? undefined, numberQuery(url, "limit")));
+  if (resource === "refresh-runs" && method === "GET") return send(response, 200, await services.queries.getRefreshRuns(projectId));
+  if (resource === "state" && method === "GET") return send(response, 200, await services.queries.getProjectState(projectId));
+  if (resource === "snapshots" && method === "GET" && segments.length === 4) return send(response, 200, await services.queries.getSnapshots(projectId));
+  if (resource === "snapshots" && method === "GET" && segments[4]) return send(response, 200, await services.queries.getSnapshot(projectId, segments[4]));
+  if (resource === "movements" && method === "GET") return send(response, 200, await services.queries.getRecentChanges(projectId, url.searchParams.get("since") ?? undefined));
+  if (resource === "conflicts" && method === "GET") return send(response, 200, await services.queries.getConflicts(projectId));
+  if (resource === "knowledge" && method === "GET" && segments.length === 4) return send(response, 200, await services.queries.getKnowledge(projectId));
+  if (resource === "knowledge" && method === "GET" && segments[4]) return send(response, 200, await services.queries.getKnowledge(projectId, segments[4]));
+  if (resource === "search" && method === "GET") return send(response, 200, await services.queries.searchProject(projectId, url.searchParams.get("q") ?? "", { domain: url.searchParams.get("domain") ?? undefined, type: url.searchParams.get("type") as import("../domain/types.js").KnowledgeType | undefined, limit: numberQuery(url, "limit") }));
+  if (resource === "deployments" && method === "GET") return send(response, 200, await services.queries.getDeployments(projectId, url.searchParams.get("environment") ?? undefined, numberQuery(url, "limit")));
   return send(response, 404, { error: "Route not found." });
 }
 
@@ -485,6 +493,7 @@ async function createOnboardedProject(request: IncomingMessage, response: Server
   assertCsrf(request, form);
   secureCredentialTransport(request);
   if (!hasOnboardingOperatorAccess(request)) return sendHtml(response, operatorRequiredPage(), 403);
+  await hydrateForMutation(services);
   const ticket = unseal<OnboardingTicket>(request, "observatory_onboarding");
   if (!ticket || ticket.expiresAt <= Date.now()) return sendHtml(response, onboardingForm(formField(form, "csrf"), {}, "Connection confirmation expired. Test the connection again."), 400, { "set-cookie": clearCookie("observatory_onboarding", "/projects/new") });
   try {
@@ -510,41 +519,52 @@ async function createOnboardedProject(request: IncomingMessage, response: Server
   sendRedirect(response, `/projects/${encodeURIComponent(project.slug)}?onboarding=complete`, [clearCookie("observatory_onboarding", "/projects/new")]);
 }
 
-async function testExistingSource(request: IncomingMessage, response: ServerResponse, services: ObservatoryHttpServices, projectRef: string, sourceId: string): Promise<void> {
+async function testExistingSource(request: IncomingMessage, response: ServerResponse, services: ResolvedHttpServices, projectRef: string, sourceId: string): Promise<void> {
   const form = await formBody(request);
   sameOrigin(request);
   assertCsrf(request, form);
   if (!hasOnboardingOperatorAccess(request)) return sendHtml(response, operatorRequiredPage(), 403);
-  const project = services.queries.getProject(projectRef);
+  await hydrateForMutation(services);
+  const project = await services.queries.getProject(projectRef);
   const health = await services.refresh.checkSource(project.id, sourceId);
   return sendHtml(response, sourceActionPage(project.slug, `Connection test: ${health.state}.`, formField(form, "csrf")));
 }
 
-async function replaceExistingSourceCredential(request: IncomingMessage, response: ServerResponse, services: ObservatoryHttpServices, projectRef: string, sourceId: string): Promise<void> {
+async function replaceExistingSourceCredential(request: IncomingMessage, response: ServerResponse, services: ResolvedHttpServices, projectRef: string, sourceId: string): Promise<void> {
   const form = await formBody(request);
   sameOrigin(request);
   assertCsrf(request, form);
   secureCredentialTransport(request);
   if (!hasOnboardingOperatorAccess(request)) return sendHtml(response, operatorRequiredPage(), 403);
-  const project = services.queries.getProject(projectRef);
+  await hydrateForMutation(services);
+  const project = await services.queries.getProject(projectRef);
   const source = services.registry.getSources(project.id).find((candidate) => candidate.id === sourceId);
   if (!source || source.provider !== "github") return sendHtml(response, sourceActionPage(project.slug, "Credential replacement is not available for this source.", formField(form, "csrf")), 400);
   await services.registry.replaceSourceCredential(project.id, sourceId, formField(form, "token"), actor(request));
   return sendHtml(response, sourceActionPage(project.slug, "Credential replaced securely. Test the connection before refreshing.", formField(form, "csrf")));
 }
 
-async function refreshExistingProject(request: IncomingMessage, response: ServerResponse, services: ObservatoryHttpServices, projectRef: string): Promise<void> {
+async function refreshExistingProject(request: IncomingMessage, response: ServerResponse, services: ResolvedHttpServices, projectRef: string): Promise<void> {
   const form = await formBody(request);
   sameOrigin(request);
   assertCsrf(request, form);
   if (!hasOnboardingOperatorAccess(request)) return sendHtml(response, operatorRequiredPage(), 403);
-  const project = services.queries.getProject(projectRef);
+  await hydrateForMutation(services);
+  const project = await services.queries.getProject(projectRef);
   const result = await services.refresh.refresh(project.id);
   if (result.run.status === "failed") return sendHtml(response, onboardingIncomplete(project.slug, formField(form, "csrf")), 202);
   return sendHtml(response, sourceActionPage(project.slug, `Refresh ${result.run.status}.`, formField(form, "csrf")));
 }
 
 function publicSource(source: ProjectSource) { return { id: source.id, projectId: source.projectId, type: source.type, provider: source.provider, enabled: source.enabled, lastHealth: source.lastHealth, lastCheckedAt: source.lastCheckedAt }; }
+/**
+ * Refresh/onboarding still use the established array-based mutation pipeline.
+ * This compatibility hydration is intentionally reachable only from operator
+ * write routes; ordinary HTTP and MCP reads never invoke it.
+ */
+async function hydrateForMutation(services: { store?: ObservatoryStore }): Promise<void> {
+  if (services.store && "persistent" in services.store && services.store.persistent === true) await services.store.reload();
+}
 function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 function stringField(value: Record<string, unknown>, key: string): string { const field = value[key]; if (typeof field !== "string" || !field.trim()) throw new Error(`'${key}' must be a non-empty string.`); return field; }
 function assistantQuestion(value: Record<string, unknown>): string { const question = stringField(value, "question"); if (question.trim().length > 2_000) throw new Error("'question' must be at most 2000 characters."); return question; }
@@ -572,31 +592,31 @@ function send(response: ServerResponse, status: number, data: unknown, headers: 
 function sendHtml(response: ServerResponse, html: string, status = 200, headers: Record<string, string | string[]> = {}): void { response.writeHead(status, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", ...headers }); response.end(html); }
 function sendRedirect(response: ServerResponse, location: string, cookies: string[] = []): void { response.writeHead(303, { location, "cache-control": "no-store", ...(cookies.length ? { "set-cookie": cookies } : {}) }); response.end(); }
 function isBrowserPageRequest(request: IncomingMessage): boolean { const path = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`).pathname; return request.method === "GET" && path !== "/api" && !path.startsWith("/api/") && path !== "/mcp" && !path.startsWith("/mcp/"); }
-function projectCards(projects: ReturnType<ProjectQueryService["listProjects"]>): string { return projects.map((project) => `<article><h2><a href="/projects/${encodeURIComponent(project.slug)}">${escapeHtml(project.name)}</a></h2><p><code>${escapeHtml(project.slug)}</code></p><dl><dt>Repository</dt><dd>${escapeHtml(project.repositoryRevision ?? "Not observed")}</dd><dt>Deployment</dt><dd>${escapeHtml(project.deploymentRevision ?? "Not observed")}</dd><dt>Conflicts</dt><dd>${project.unresolvedConflictCount}</dd><dt>Recent movements</dt><dd>${project.recentMovementCount}</dd></dl></article>`).join("") || "<p>No projects registered. Use <code>POST /api/projects</code> to register one.</p>"; }
-function dashboard(projects: ReturnType<ProjectQueryService["listProjects"]>): string { return layout("Project Observatory", `<h1>Project Observatory</h1><p>Evidence-backed, read-only project intelligence.</p><p><a href="/projects">Browse all registered projects</a> <a class="button" href="/projects/new">Add project</a></p><main>${projectCards(projects)}</main>`); }
-function projectsIndex(projects: ReturnType<ProjectQueryService["listProjects"]>): string { return layout("Projects — Project Observatory", `<h1>Projects</h1><p>Registered projects and their observed evidence summaries.</p><p><a class="button" href="/projects/new">Add project</a></p><main>${projectCards(projects)}</main>`); }
+function projectCards(projects: ProjectSummary[]): string { return projects.map((project) => `<article><h2><a href="/projects/${encodeURIComponent(project.slug)}">${escapeHtml(project.name)}</a></h2><p><code>${escapeHtml(project.slug)}</code></p><dl><dt>Repository</dt><dd>${escapeHtml(project.repositoryRevision ?? "Not observed")}</dd><dt>Deployment</dt><dd>${escapeHtml(project.deploymentRevision ?? "Not observed")}</dd><dt>Conflicts</dt><dd>${project.unresolvedConflictCount}</dd><dt>Recent movements</dt><dd>${project.recentMovementCount}</dd></dl></article>`).join("") || "<p>No projects registered. Use <code>POST /api/projects</code> to register one.</p>"; }
+function dashboard(projects: ProjectSummary[]): string { return layout("Project Observatory", `<h1>Project Observatory</h1><p>Evidence-backed, read-only project intelligence.</p><p><a href="/projects">Browse all registered projects</a> <a class="button" href="/projects/new">Add project</a></p><main>${projectCards(projects)}</main>`); }
+function projectsIndex(projects: ProjectSummary[]): string { return layout("Projects — Project Observatory", `<h1>Projects</h1><p>Registered projects and their observed evidence summaries.</p><p><a class="button" href="/projects/new">Add project</a></p><main>${projectCards(projects)}</main>`); }
 function browserNotFound(message = "The requested browser page was not found."): string { return layout("Page not found — Project Observatory", `<h1>Page not found</h1><p>${escapeHtml(message)}</p><p><a href="/">Return to Project Observatory</a> or <a href="/projects">browse projects</a>.</p>`); }
-function projectScreen(services: ObservatoryHttpServices, projectRef: string, page: string, onboardingComplete: boolean, csrf: string, canOperate: boolean): string {
-  const state = services.queries.getProjectState(projectRef);
+async function projectScreen(services: ResolvedHttpServices, projectRef: string, page: string, onboardingComplete: boolean, csrf: string, canOperate: boolean): Promise<string> {
+  const state = await services.queries.getProjectState(projectRef);
   const project = state.project;
   const base = `/projects/${encodeURIComponent(project.slug)}`;
   const navItems = ["overview", "state", "knowledge", "movements", "sources", "ask", ...(services.assistantUiEnabled ? ["assistant"] : [])];
   const nav = navItems.map((item) => `<a class="${page === item ? "active" : ""}" href="${base}${item === "overview" ? "" : `/${item}`}">${item.replace(/^./, (char) => char.toUpperCase())}</a>`).join("");
   let content: string;
   switch (page) {
-    case "overview": content = `${onboardingComplete ? onboardingSuccess(services.queries.getOnboardingSummary(project.id), project.name) : ""}<h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.description ?? "No project description.")}</p><section><h2>Current snapshot</h2><dl><dt>Repository head</dt><dd>${escapeHtml(state.snapshot?.repositoryRevision ?? "Unknown")}</dd><dt>Production deployment</dt><dd>${escapeHtml(state.snapshot?.deploymentRevision ?? "Unknown")}</dd><dt>Knowledge items</dt><dd>${state.summary?.knowledgeCount ?? 0}</dd><dt>Resolution</dt><dd>${escapeHtml(state.summary?.resolution ?? "No snapshot")}</dd></dl></section><section><h2>Unresolved conflicts</h2>${list(state.unresolvedConflicts.map((conflict) => `${conflict.severity}: ${conflict.title}`))}</section><section><h2>Recent movements</h2>${list(state.latestMovements.slice(0, 8).map((movement) => `${movement.movementType}: ${movement.entityKey}`))}</section>`; break;
+    case "overview": content = `${onboardingComplete ? onboardingSuccess(await services.queries.getOnboardingSummary(project.id), project.name) : ""}<h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.description ?? "No project description.")}</p><section><h2>Current snapshot</h2><dl><dt>Repository head</dt><dd>${escapeHtml(state.snapshot?.repositoryRevision ?? "Unknown")}</dd><dt>Production deployment</dt><dd>${escapeHtml(state.snapshot?.deploymentRevision ?? "Unknown")}</dd><dt>Knowledge items</dt><dd>${state.summary?.knowledgeCount ?? 0}</dd><dt>Resolution</dt><dd>${escapeHtml(state.summary?.resolution ?? "No snapshot")}</dd></dl></section><section><h2>Unresolved conflicts</h2>${list(state.unresolvedConflicts.map((conflict) => `${conflict.severity}: ${conflict.title}`))}</section><section><h2>Recent movements</h2>${list(state.latestMovements.slice(0, 8).map((movement) => `${movement.movementType}: ${movement.entityKey}`))}</section>`; break;
     case "state": content = `<h1>Current State</h1>${json(state)}`; break;
-    case "knowledge": content = `<h1>Knowledge</h1>${list(services.queries.getKnowledge(project.id).map((record) => `${record.item.type}: ${record.item.title} — ${record.provenance.map((provenance) => provenance.path ?? provenance.sourceRef).join(", ")}`))}`; break;
-    case "movements": content = `<h1>Movements</h1>${list(services.queries.getRecentChanges(project.id).map((movement) => `${movement.createdAt}: ${movement.movementType} ${movement.entityKey}`))}`; break;
-    case "sources": content = sourcesScreen(project.slug, services.registry.getSources(project.id), csrf, canOperate); break;
-    case "ask": content = askScreen(project.slug, project.name, services.queries.listProjects()); break;
-    case "assistant": content = assistantScreen(project.slug, project.name, services.queries.listProjects(), Boolean(services.agent)); break;
+    case "knowledge": content = `<h1>Knowledge</h1>${list((await services.queries.getKnowledge(project.id)).map((record) => `${record.item.type}: ${record.item.title} — ${record.provenance.map((provenance) => provenance.path ?? provenance.sourceRef).join(", ")}`))}`; break;
+    case "movements": content = `<h1>Movements</h1>${list((await services.queries.getRecentChanges(project.id)).map((movement) => `${movement.createdAt}: ${movement.movementType} ${movement.entityKey}`))}`; break;
+    case "sources": content = sourcesScreen(project.slug, await services.queries.getSources(project.id), csrf, canOperate); break;
+    case "ask": content = askScreen(project.slug, project.name, await services.queries.listProjects()); break;
+    case "assistant": content = assistantScreen(project.slug, project.name, await services.queries.listProjects(), Boolean(services.agent)); break;
     default: throw new Error("Browser page not found.");
   }
   return layout(`${project.name} — Project Observatory`, `<nav class="project-nav">${nav}</nav>${content}`);
 }
 
-function askScreen(slug: string, name: string, projects: ReturnType<ProjectQueryService["listProjects"]>): string {
+function askScreen(slug: string, name: string, projects: ProjectSummary[]): string {
   const options = projects.map((project) => `<option value="${escapeHtml(project.slug)}"${project.slug === slug ? " selected" : ""}>${escapeHtml(project.name)}</option>`).join("");
   const suggestions = ["Where is this value configured?", "How does this feature work?", "Which tests cover this behaviour?", "Where would I change this safely?", "What changed recently in this area?"];
   return `<h1>Ask ${escapeHtml(name)}</h1><p class="project-label">Project: <strong>${escapeHtml(name)}</strong></p><label for="ask-project">Project selector<select id="ask-project" aria-label="Project selector">${options}</select></label><form id="ask-form"><label for="ask-question">Ask a question about ${escapeHtml(name)}<textarea id="ask-question" name="question" maxlength="2000" required placeholder="Where is this value configured?"></textarea></label><button type="submit">Ask</button></form><section class="wide"><h2>Suggested questions</h2><p>${suggestions.map((suggestion) => `<button class="suggestion" type="button" data-question="${escapeHtml(suggestion)}">${escapeHtml(suggestion)}</button>`).join("")}</p></section><section id="ask-result" class="wide" aria-live="polite"><p class="muted">Answers are grounded only in this project’s current indexed snapshot.</p></section><script>
@@ -633,7 +653,7 @@ function askScreen(slug: string, name: string, projects: ReturnType<ProjectQuery
  * live only in this page's JavaScript memory. The server receives bounded,
  * untrusted linguistic context and always re-grounds a substantive answer.
  */
-function assistantScreen(slug: string, name: string, projects: ReturnType<ProjectQueryService["listProjects"]>, initiallyConfigured: boolean): string {
+function assistantScreen(slug: string, name: string, projects: ProjectSummary[], initiallyConfigured: boolean): string {
   const options = projects.map((project) => `<option value="${escapeHtml(project.slug)}"${project.slug === slug ? " selected" : ""}>${escapeHtml(project.name)}</option>`).join("");
   const suggestions = ["Where is this value configured?", "How does this feature work?", "Which tests cover this behaviour?", "Where would I change this safely?", "What changed recently in this area?"];
   const askHref = `/projects/${encodeURIComponent(slug)}/ask`;
@@ -686,7 +706,7 @@ function onboardingForm(csrf: string, values: Partial<Omit<OnboardingFields, "to
 
 function onboardingReady(values: Omit<OnboardingFields, "token">, revision: string, csrf: string): string { return layout("Connection healthy — Project Observatory", `<h1>Connection healthy</h1><p class="notice success">Healthy<br>Repository accessible<br>Branch: ${escapeHtml(values.branch)}</p><dl><dt>Project</dt><dd>${escapeHtml(values.name)}</dd><dt>Repository</dt><dd>${escapeHtml(values.repository)}</dd><dt>Repository revision</dt><dd>${escapeHtml(revision)}</dd></dl><p>The tested credential is held only in an encrypted, short-lived HttpOnly onboarding cookie until creation.</p><form method="post" action="/projects/new/create"><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"><button type="submit">Create project and ingest</button></form><p><a href="/projects/new">Start over</a></p>`); }
 
-function onboardingSuccess(summary: ReturnType<ProjectQueryService["getOnboardingSummary"]>, name: string): string { return `<section class="wide notice success"><h2>${escapeHtml(name)} onboarded</h2><dl><dt>Repository</dt><dd>${escapeHtml(summary.repository ?? "Not observed")}</dd><dt>Repository revision</dt><dd>${escapeHtml(summary.repositoryRevision ?? "Not observed")}</dd><dt>Source health</dt><dd>${escapeHtml(summary.sourceHealth ?? "Unknown")}</dd><dt>Refresh status</dt><dd>${escapeHtml(summary.refreshStatus ?? "Unknown")}</dd><dt>Snapshot ID</dt><dd><code>${escapeHtml(summary.snapshotId ?? "No snapshot")}</code></dd><dt>Artifacts</dt><dd>${summary.artifactCount}</dd><dt>Knowledge</dt><dd>${summary.knowledgeCount}</dd><dt>Provenance</dt><dd>${summary.provenanceCount}</dd><dt>Open conflicts</dt><dd>${summary.openConflictCount}</dd></dl></section>`; }
+function onboardingSuccess(summary: OnboardingSummary, name: string): string { return `<section class="wide notice success"><h2>${escapeHtml(name)} onboarded</h2><dl><dt>Repository</dt><dd>${escapeHtml(summary.repository ?? "Not observed")}</dd><dt>Repository revision</dt><dd>${escapeHtml(summary.repositoryRevision ?? "Not observed")}</dd><dt>Source health</dt><dd>${escapeHtml(summary.sourceHealth ?? "Unknown")}</dd><dt>Refresh status</dt><dd>${escapeHtml(summary.refreshStatus ?? "Unknown")}</dd><dt>Snapshot ID</dt><dd><code>${escapeHtml(summary.snapshotId ?? "No snapshot")}</code></dd><dt>Artifacts</dt><dd>${summary.artifactCount}</dd><dt>Knowledge</dt><dd>${summary.knowledgeCount}</dd><dt>Provenance</dt><dd>${summary.provenanceCount}</dd><dt>Open conflicts</dt><dd>${summary.openConflictCount}</dd></dl></section>`; }
 
 function onboardingIncomplete(slug: string, csrf: string): string { const base = `/projects/${encodeURIComponent(slug)}`; return layout("Onboarding incomplete — Project Observatory", `<h1>Onboarding incomplete — refresh failed</h1><p>The project and encrypted source configuration were preserved. Retry the read-only refresh when the repository is reachable.</p><form method="post" action="${base}/refresh"><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"><button type="submit">Retry refresh</button></form><p><a href="${base}/sources">View sources</a> · <a href="${base}">Project overview</a></p>`); }
 

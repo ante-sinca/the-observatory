@@ -2,7 +2,8 @@ import { safeText } from "../core/security.js";
 import type { Conflict, KnowledgeWithProvenance, Movement } from "../domain/types.js";
 import type { AskProjectEvidence, AskProjectResponse, AskProjectStatus } from "../services/ask-project.js";
 import { AskProjectService } from "../services/ask-project.js";
-import { ProjectQueryService, type ProjectState } from "../services/query.js";
+import type { ProjectState } from "../services/query.js";
+import { asReadService, type ObservatoryReadInput, type ObservatoryReadService } from "../services/read-service.js";
 import { OBSERVATORY_AGENT_SYSTEM_INSTRUCTION, answerPrefix } from "./evidence-policy.js";
 import { IntelligenceProviderError, type IntelligenceMessage, type IntelligenceProvider, type IntelligenceToolDefinition } from "./provider.js";
 import { classifyAssistantQuestion, evaluateAnswerSufficiency, valueTracingQueries, type AnswerSufficiency, type EvaluatedEvidence, type SufficiencyAssessment } from "./sufficiency.js";
@@ -65,21 +66,24 @@ export class ObservatoryAgentService {
 
   constructor(
     private readonly provider: IntelligenceProvider,
-    private readonly queries: ProjectQueryService,
+    queries: ObservatoryReadInput,
     private readonly askProject: AskProjectService,
     private readonly options: ObservatoryAgentOptions,
   ) {
+    this.queries = asReadService(queries);
     this.maxToolIterations = boundedOption(options.maxToolIterations, DEFAULT_MAX_TOOL_ITERATIONS, 1, 8);
     this.maxToolCalls = boundedOption(options.maxToolCalls, DEFAULT_MAX_TOOL_CALLS, 1, 16);
     this.maxContextCharacters = boundedOption(options.maxContextCharacters, DEFAULT_MAX_CONTEXT_CHARACTERS, 2_000, 48_000);
   }
+
+  private readonly queries: ObservatoryReadService;
 
   async answer(projectRef: string, rawQuestion: string, conversation: AssistantConversationContext = {}): Promise<ObservatoryAgentResponse> {
     const question = resolveConversationQuestion(rawQuestion, conversation);
     // Anchor every response in the existing deterministic selection/status
     // before the model is asked to interpret anything.
     const deterministic = await this.askProject.ask(projectRef, question);
-    const project = this.queries.getProject(projectRef);
+    const project = await this.queries.getProject(projectRef);
     const initialTrace = await this.traceValueEvidence(project.id, question, deterministic);
     const toolCalls: ObservatoryAgentToolCall[] = [...initialTrace.toolCalls];
     let responseEvidence = initialTrace.evidence;
@@ -126,7 +130,7 @@ export class ObservatoryAgentService {
           const trace = await this.callTool(call.name, call.arguments, project.id);
           toolCalls.push(trace);
           responseEvidence = mergeEvidence(responseEvidence, evidenceFromToolTrace(trace));
-          assessment = evaluateAnswerSufficiency(question, deterministic.status, this.evaluatedEvidence(project.id, responseEvidence));
+          assessment = evaluateAnswerSufficiency(question, deterministic.status, await this.evaluatedEvidence(project.id, responseEvidence));
           if (assessment.intent === "value_lookup" && assessment.answerSufficiency === "sufficient") {
             return completedResponse(deterministic, responseEvidence, assessment, "", toolCalls);
           }
@@ -149,20 +153,20 @@ export class ObservatoryAgentService {
   /** Bounded, deterministic symbol tracing for factual value questions. */
   private async traceValueEvidence(projectId: string, question: string, anchor: AskProjectResponse): Promise<{ evidence: AskProjectEvidence[]; assessment: SufficiencyAssessment; toolCalls: ObservatoryAgentToolCall[] }> {
     let evidence = [...anchor.evidence];
-    let assessment = evaluateAnswerSufficiency(question, anchor.status, this.evaluatedEvidence(projectId, evidence));
+    let assessment = evaluateAnswerSufficiency(question, anchor.status, await this.evaluatedEvidence(projectId, evidence));
     const toolCalls: ObservatoryAgentToolCall[] = [];
     if (classifyAssistantQuestion(question) !== "value_lookup" || assessment.answerSufficiency !== "incomplete") return { evidence, assessment, toolCalls };
 
-    for (const query of valueTracingQueries(question, this.evaluatedEvidence(projectId, evidence))) {
+    for (const query of valueTracingQueries(question, await this.evaluatedEvidence(projectId, evidence))) {
       if (toolCalls.length >= Math.min(this.maxToolCalls, 6) || assessment.answerSufficiency !== "incomplete") break;
       const followUp = await this.askProject.ask(projectId, query);
       const before = evidence.length;
       evidence = mergeEvidence(evidence, followUp.evidence);
       const found = evidence.length > before;
       toolCalls.push({ name: "ask_project", input: { question: query }, outcome: "completed", retrievalReason: "value_trace_follow_up", reason: found ? "new_evidence_found" : "no_new_evidence", result: askResult(followUp) });
-      assessment = evaluateAnswerSufficiency(question, anchor.status, this.evaluatedEvidence(projectId, evidence));
+      assessment = evaluateAnswerSufficiency(question, anchor.status, await this.evaluatedEvidence(projectId, evidence));
       if (toolCalls.length >= Math.min(this.maxToolCalls, 6) || assessment.answerSufficiency !== "incomplete") continue;
-      const artifacts = this.queries.searchCurrentSourceArtifacts(projectId, query, 20);
+      const artifacts = await this.queries.searchCurrentSourceArtifacts(projectId, query, 20);
       const beforeArtifactSearch = evidence.length;
       evidence = mergeEvidence(evidence, artifacts.map((artifact) => evidenceForArtifact(artifact, query)));
       toolCalls.push({
@@ -173,22 +177,22 @@ export class ObservatoryAgentService {
         reason: evidence.length > beforeArtifactSearch ? "new_evidence_found" : "no_new_evidence",
         result: { query, artifactMatches: artifacts.slice(0, 20).map((artifact) => ({ artifactId: artifact.id, path: artifact.path, repositoryRevision: artifact.revision, contentHash: artifact.contentHash })) },
       });
-      assessment = evaluateAnswerSufficiency(question, anchor.status, this.evaluatedEvidence(projectId, evidence));
+      assessment = evaluateAnswerSufficiency(question, anchor.status, await this.evaluatedEvidence(projectId, evidence));
     }
     return { evidence, assessment, toolCalls };
   }
 
-  private evaluatedEvidence(projectId: string, evidence: AskProjectEvidence[]): EvaluatedEvidence[] {
-    return evidence.map((item) => {
+  private async evaluatedEvidence(projectId: string, evidence: AskProjectEvidence[]): Promise<EvaluatedEvidence[]> {
+    return Promise.all(evidence.map(async (item) => {
       if (!item.artifactId) return { evidence: item };
       try {
-        const artifact = this.queries.getSourceArtifact(projectId, item.artifactId);
+        const artifact = await this.queries.getSourceArtifact(projectId, item.artifactId);
         if (item.repositoryRevision && artifact.revision !== item.repositoryRevision) return { evidence: item };
         return { evidence: item, excerpt: boundedEvidenceExcerpt(artifact.content ?? "", item.startLine, item.endLine) };
       } catch {
         return { evidence: item };
       }
-    });
+    }));
   }
 
   private async callTool(name: string, input: Record<string, unknown>, projectId: string): Promise<ObservatoryAgentToolCall> {
@@ -205,7 +209,7 @@ export class ObservatoryAgentService {
   private async executeTool(name: keyof typeof toolNames, input: Record<string, unknown>, projectId: string): Promise<Record<string, unknown>> {
     switch (name) {
       case "list_projects":
-        return { projects: this.queries.listProjects().slice(0, 50).map((project) => ({ slug: safeText(project.slug), name: safeText(project.name), repositoryRevision: project.repositoryRevision ? safeText(project.repositoryRevision) : undefined, unresolvedConflictCount: project.unresolvedConflictCount })) };
+        return { projects: (await this.queries.listProjects()).slice(0, 50).map((project) => ({ slug: safeText(project.slug), name: safeText(project.name), repositoryRevision: project.repositoryRevision ? safeText(project.repositoryRevision) : undefined, unresolvedConflictCount: project.unresolvedConflictCount })) };
       case "ask_project": {
         const response = await this.askProject.ask(projectId, input.question as string);
         return askResult(response);
@@ -213,11 +217,11 @@ export class ObservatoryAgentService {
       case "search_knowledge":
         return searchResult(this.queries, projectId, input.query as string, input.limit as number | undefined);
       case "get_current_snapshot":
-        return snapshotResult(this.queries.getProjectState(projectId));
+        return snapshotResult(await this.queries.getProjectState(projectId));
       case "get_movements":
-        return movementsResult(this.queries.getRecentChanges(projectId).slice(0, (input.limit as number | undefined) ?? 20));
+        return movementsResult((await this.queries.getRecentChanges(projectId)).slice(0, (input.limit as number | undefined) ?? 20));
       case "get_conflicts":
-        return conflictsResult(this.queries.getConflicts(projectId));
+        return conflictsResult(await this.queries.getConflicts(projectId));
       case "get_evidence":
         return evidenceResult(this.queries, projectId, input.artifactId as string, input.startLine as number | undefined, input.endLine as number | undefined);
     }
@@ -294,11 +298,9 @@ function snapshotResult(state: ProjectState): Record<string, unknown> {
   };
 }
 
-function searchResult(queries: ProjectQueryService, projectId: string, query: string, limit = 10): Record<string, unknown> {
-  const state = queries.getProjectState(projectId);
-  const current = new Set(state.snapshot?.knowledgeItemIds ?? []);
-  const results = queries.searchProject(projectId, query, { limit: Math.min(limit, 20) })
-    .filter((record) => current.has(record.item.id))
+async function searchResult(queries: ObservatoryReadService, projectId: string, query: string, limit = 10): Promise<Record<string, unknown>> {
+  const state = await queries.getProjectState(projectId);
+  const results = (await queries.searchProject(projectId, query, { limit: Math.min(limit, 20) }))
     .slice(0, Math.min(limit, 20))
     .map(knowledgeResult);
   return { project: safeText(state.project.slug), repositoryRevision: state.snapshot?.repositoryRevision ? safeText(state.snapshot.repositoryRevision) : undefined, results };
@@ -320,9 +322,9 @@ function conflictsResult(conflicts: Conflict[]): Record<string, unknown> {
   return { conflicts: conflicts.slice(0, 20).map((conflict) => ({ id: safeText(conflict.id).slice(0, 160), snapshotId: safeText(conflict.snapshotId).slice(0, 160), type: conflict.type, severity: conflict.severity, title: safeText(conflict.title).slice(0, 300), description: safeText(conflict.description).slice(0, 1_000), evidence: safeRecord(conflict.evidence) })) };
 }
 
-function evidenceResult(queries: ProjectQueryService, projectId: string, artifactId: string, requestedStart?: number, requestedEnd?: number): Record<string, unknown> {
-  const state = queries.getProjectState(projectId);
-  const artifact = queries.getSourceArtifact(projectId, artifactId);
+async function evidenceResult(queries: ObservatoryReadService, projectId: string, artifactId: string, requestedStart?: number, requestedEnd?: number): Promise<Record<string, unknown>> {
+  const state = await queries.getProjectState(projectId);
+  const artifact = await queries.getSourceArtifact(projectId, artifactId);
   if (!state.snapshot?.repositoryRevision || artifact.revision !== state.snapshot.repositoryRevision) throw new Error("Evidence is not current.");
   const lines = (artifact.content ?? "").split("\n");
   const startLine = requestedStart ?? 1;

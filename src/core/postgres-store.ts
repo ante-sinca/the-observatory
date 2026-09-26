@@ -38,10 +38,10 @@ function parameterJson(value: unknown): string { return JSON.stringify(value ?? 
 function nullableParameterJson(value: unknown): string { return JSON.stringify(value ?? null); }
 
 /**
- * A durable mirror of the domain store. Domain services continue to operate on
- * the same arrays used by MemoryStore; each successful mutating service call
- * flushes a complete, transactionally ordered state transition to PostgreSQL.
- * No query path talks to PostgreSQL outside this shared storage/service layer.
+ * A durable mirror of the domain store. The arrays remain the explicit
+ * mutation/refresh model, while ordinary request reads use the targeted
+ * PostgresReadService boundary through queryRead(). This intentionally keeps
+ * cold starts from copying source_artifacts.content_text into process memory.
  */
 export class PostgresStore extends MemoryStore {
   readonly persistent = true;
@@ -54,14 +54,36 @@ export class PostgresStore extends MemoryStore {
     if (!connectionString) throw new Error("A provider-managed PostgreSQL connection is required (DATABASE_URL).");
     this.pool = new Pool({ connectionString: verifiedPostgresUrl(connectionString), max: 4 });
     if (process.env.VERCEL === "1") attachDatabasePool(this.pool);
-    this.loaded = this.enqueue(() => this.load());
+    // Construction must be egress-free. The legacy array model is hydrated
+    // only for an explicit mutation/refresh operation, never for a read.
+    this.loaded = Promise.resolve();
   }
 
   async ready(): Promise<void> { await this.loaded; }
 
+  /**
+   * Compatibility path for the existing array-based mutation pipeline. It is
+   * deliberately never called by the Vercel request wrapper. A future write
+   * model can replace this with transactional, delta-based writes (v0.2E).
+   */
   async reload(): Promise<void> { await this.enqueue(() => this.load()); }
 
   async close(): Promise<void> { await this.pool.end(); }
+
+  /**
+   * Parameterized, bounded read seam used by PostgresReadService. Diagnostics
+   * expose only category/count/approximate bytes, never SQL parameters or
+   * returned text. Artifact bodies must opt in explicitly at each call site.
+   */
+  async queryRead(category: string, text: string, values: unknown[] = [], artifactContent = false): Promise<Row[]> {
+    if (artifactContent) assertBoundedArtifactRead(text);
+    const result = await this.pool.query<Row>(text, values);
+    if (process.env.OBSERVATORY_DB_DIAGNOSTICS === "true") {
+      const bytes = result.rows.reduce((total, row) => total + approximateRowBytes(row), 0);
+      console.info(`db_read category=${category} rows=${result.rowCount ?? result.rows.length} approx_bytes=${bytes} artifact_content=${artifactContent}`);
+    }
+    return result.rows;
+  }
 
   private async load(): Promise<void> {
     const client = await this.pool.connect();
@@ -153,8 +175,22 @@ export class PostgresStore extends MemoryStore {
   }
 }
 
+/** Regression guard: ordinary durable reads may never scan artifact bodies. */
+export function assertBoundedArtifactRead(sql: string): void {
+  const normalized = sql.replace(/\s+/g, " ").toLowerCase();
+  if (!/content_text/.test(normalized) || !/from source_artifacts(?:\s|\w)/.test(normalized)) return;
+  const scoped = /where .*project_id/.test(normalized) && (/(?:\bid\b|\.id)\s*=/.test(normalized) || /\.path\s*=/.test(normalized) || /\.revision\s*=/.test(normalized) || /join lateral \(select repository_revision/.test(normalized));
+  const limited = /\blimit\s+\$?\d+/.test(normalized);
+  if (!scoped || !limited) throw new Error("Artifact content reads must be project-scoped and bounded.");
+}
+
 function optionalString(value: unknown): string | undefined { return value === null || value === undefined ? undefined : String(value); }
 function optionalNumber(value: unknown): number | undefined { return value === null || value === undefined ? undefined : Number(value); }
+function approximateRowBytes(row: Row): number {
+  // JSON gives a conservative, content-agnostic approximation without ever
+  // emitting the row itself. Diagnostic calculation is local CPU only.
+  try { return Buffer.byteLength(JSON.stringify(row), "utf8"); } catch { return 0; }
+}
 
 async function upsertProject(client: PoolClient, item: Project): Promise<void> { await client.query("INSERT INTO projects (id,slug,name,description,status,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO UPDATE SET slug=EXCLUDED.slug,name=EXCLUDED.name,description=EXCLUDED.description,status=EXCLUDED.status,updated_at=EXCLUDED.updated_at", [item.id, item.slug, item.name, item.description ?? null, item.status, item.createdAt, item.updatedAt]); }
 async function upsertSource(client: PoolClient, item: ProjectSource): Promise<void> { await client.query("INSERT INTO project_sources (id,project_id,type,provider,config_json_encrypted,enabled,last_health_status,last_checked_at) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8) ON CONFLICT (id) DO UPDATE SET provider=EXCLUDED.provider,config_json_encrypted=EXCLUDED.config_json_encrypted,enabled=EXCLUDED.enabled,last_health_status=EXCLUDED.last_health_status,last_checked_at=EXCLUDED.last_checked_at", [item.id, item.projectId, item.type, item.provider, item.encryptedConfig, item.enabled, nullableParameterJson(item.lastHealth), item.lastCheckedAt ?? null]); }

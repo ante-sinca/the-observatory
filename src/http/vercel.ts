@@ -21,11 +21,10 @@ export function createVercelHandler(services: Promise<Observatory>) {
     // path in a reserved query parameter so the framework-neutral router sees
     // /health, /, and all API/MCP paths exactly as it does under node:http.
     request.url = restoreVercelRequestUrl(request.url, request.headers.host ?? "localhost");
-    // A warm serverless instance may have served another invocation before a
-    // different instance committed data. Rehydrate before every request so
-    // response correctness never depends on sticky process memory.
+    // Reads use request-scoped, targeted PostgreSQL queries. A warm instance
+    // therefore observes canonical state without rehydrating the database
+    // (and every artifact body) into process memory before each invocation.
     const initialized = await services;
-    await initialized.store.reload();
     await handleHttpRequest(request, response, initialized);
   } catch (error) {
     response.writeHead(500, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
@@ -34,8 +33,8 @@ export function createVercelHandler(services: Promise<Observatory>) {
   };
 }
 
-// Vercel may reuse this promise between invocations. The handler still reloads
-// canonical Neon state before serving each request.
+// Vercel may reuse this promise between invocations; read services query
+// current canonical rows for every request rather than reuse array state.
 export default function vercelHandler(request: IncomingMessage, response: ServerResponse): Promise<void> {
   observatory ??= createObservatory();
   return createVercelHandler(observatory)(request, response);

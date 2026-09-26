@@ -2,6 +2,7 @@ import { isAllowedArtifact, safeText } from "../core/security.js";
 import type { ObservatoryStore } from "../core/store.js";
 import type { Conflict, KnowledgeItem, Project, Provenance, Snapshot, SourceArtifact } from "../domain/types.js";
 import { ProjectQueryService } from "./query.js";
+import { MemoryReadService, type ObservatoryReadService } from "./read-service.js";
 
 export type QuestionIntent = "location" | "behavior" | "change_path" | "history" | "tests" | "state_config";
 export type AskProjectStatus = "verified_current" | "partial" | "insufficient_evidence" | "conflicted";
@@ -86,20 +87,25 @@ const STOP_WORDS = new Set(["a", "an", "and", "are", "at", "be", "can", "code", 
  * external model dependency.
  */
 export class AskProjectService {
+  private readonly reads: ObservatoryReadService;
+
   constructor(
-    private readonly store: ObservatoryStore,
-    private readonly queries: ProjectQueryService,
+    _store: ObservatoryStore,
+    queries: ProjectQueryService | ObservatoryReadService,
     private readonly generator: ProjectAnswerGenerator = new DeterministicProjectAnswerGenerator(),
-  ) {}
+  ) {
+    this.reads = queries instanceof ProjectQueryService ? new MemoryReadService(queries) : queries;
+  }
 
   async ask(projectRef: string, rawQuestion: string): Promise<AskProjectResponse> {
     const question = validateQuestion(rawQuestion);
-    const project = this.queries.getProject(projectRef);
-    const snapshot = latestSnapshot(this.store, project.id);
+    const project = await this.reads.getProject(projectRef);
+    const state = await this.reads.getProjectState(project.id);
+    const snapshot = state.snapshot;
     const intent = classifyQuestionIntent(question);
-    const candidates = snapshot ? this.retrieve(project.id, snapshot, question, intent) : [];
+    const candidates = snapshot ? await this.retrieve(project.id, snapshot, question, intent) : [];
     const selected = selectEvidence(candidates, intent);
-    const conflicts = snapshot ? this.relevantConflicts(project.id, snapshot, question, selected) : [];
+    const conflicts = snapshot ? await this.relevantConflicts(project.id, snapshot, question, selected) : [];
     const status = answerStatus(snapshot, selected, conflicts, intent);
     const answer = await this.generator.answer({ project, question, intent, status, evidence: { snapshot, selected, conflicts } });
 
@@ -115,35 +121,39 @@ export class AskProjectService {
     };
   }
 
-  private retrieve(projectId: string, snapshot: Snapshot, question: string, intent: QuestionIntent): Candidate[] {
+  private async retrieve(projectId: string, snapshot: Snapshot, question: string, intent: QuestionIntent): Promise<Candidate[]> {
     const terms = expandedTerms(question);
     const primary = primaryTerms(question);
     const topical = topicalTerms(question);
     if (terms.length === 0) return [];
-    const currentItems = snapshot.knowledgeItemIds.flatMap((id) => {
-      const item = this.store.knowledge.find((candidate) => candidate.id === id && candidate.projectId === projectId);
-      return item ? [item] : [];
-    });
+    // PostgreSQL performs the broad matching and limits candidates before any
+    // evidence bodies are considered. The in-memory adapter preserves the
+    // same deterministic service behaviour for tests and local development.
+    const currentRecords = await this.reads.searchProject(projectId, question, { limit: 40 });
+    const currentItems = currentRecords.map((record) => record.item);
     const currentItemIds = new Set(currentItems.map((item) => item.id));
     const candidates: Candidate[] = [];
 
     // Snapshot knowledge gives the strongest membership signal. Artifact
     // content supplies precise line locations where that content is durable.
-    for (const item of currentItems) {
-      const provenance = this.store.provenance.filter((candidate) => candidate.knowledgeItemId === item.id);
+    for (const record of currentRecords) {
+      const item = record.item;
+      const provenance = record.provenance;
       if (provenance.length === 0) candidates.push(this.candidateFor(projectId, item, undefined, undefined, true, terms, primary, intent));
       for (const source of provenance) {
-        const artifact = source.sourceArtifactId
-          ? this.store.artifacts.find((candidate) => candidate.id === source.sourceArtifactId && candidate.projectId === projectId)
-          : undefined;
-        candidates.push(this.candidateFor(projectId, item, source, artifact, true, terms, primary, intent));
+        // Provenance carries the durable path/range required for knowledge
+        // evidence. Do not fetch a body merely because a knowledge row has a
+        // provenance reference; bounded current-artifact search below is the
+        // only broad body retrieval in Ask Project.
+        candidates.push(this.candidateFor(projectId, item, source, undefined, true, terms, primary, intent));
       }
     }
 
     // Some source files deliberately produce no knowledge record yet are still
     // indexed current evidence. Keep them project- and revision-scoped.
-    for (const artifact of this.store.artifacts) {
-      if (artifact.projectId !== projectId || artifact.content === undefined || !isAllowedArtifact(artifact.path)) continue;
+    for (const result of await this.reads.searchCurrentSourceArtifacts(projectId, question, 20)) {
+      const artifact: SourceArtifact = { ...result, projectId, externalId: "", artifactType: "text", metadata: {}, firstSeenAt: "", lastSeenAt: "" };
+      if (artifact.content === undefined || !isAllowedArtifact(artifact.path)) continue;
       if (artifact.revision !== snapshot.repositoryRevision) continue;
       const alreadyCovered = candidates.some((candidate) => candidate.artifact?.id === artifact.id);
       if (!alreadyCovered) candidates.push(this.candidateFor(projectId, undefined, undefined, artifact, true, terms, primary, intent));
@@ -152,14 +162,12 @@ export class AskProjectService {
     // Historical questions may inspect prior durable evidence, but it is never
     // relabelled as current editable implementation.
     if (intent === "history") {
-      for (const item of this.store.knowledge) {
+      for (const record of await this.reads.getKnowledge(projectId)) {
+        const item = record.item;
         if (item.projectId !== projectId || currentItemIds.has(item.id)) continue;
-        const provenance = this.store.provenance.filter((candidate) => candidate.knowledgeItemId === item.id);
+        const provenance = record.provenance;
         for (const source of provenance) {
-          const artifact = source.sourceArtifactId
-            ? this.store.artifacts.find((candidate) => candidate.id === source.sourceArtifactId && candidate.projectId === projectId)
-            : undefined;
-          candidates.push(this.candidateFor(projectId, item, source, artifact, false, terms, primary, intent));
+          candidates.push(this.candidateFor(projectId, item, source, undefined, false, terms, primary, intent));
         }
       }
     }
@@ -195,12 +203,12 @@ export class AskProjectService {
     };
   }
 
-  private relevantConflicts(projectId: string, snapshot: Snapshot, question: string, selected: AnswerEvidence[]): AskProjectConflict[] {
+  private async relevantConflicts(projectId: string, snapshot: Snapshot, question: string, selected: AnswerEvidence[]): Promise<AskProjectConflict[]> {
     const terms = expandedTerms(question);
     const topical = topicalTerms(question);
     const selectedArtifactIds = new Set(selected.map((item) => item.artifactId).filter((id): id is string => Boolean(id)));
     const selectedPaths = new Set(selected.map((item) => item.path).filter((path): path is string => Boolean(path)));
-    return this.store.conflicts
+    return (await this.reads.getConflicts(projectId))
       .filter((conflict) => conflict.projectId === projectId && conflict.snapshotId === snapshot.id && conflict.status === "open")
       .filter((conflict) => {
         const searchable = `${conflict.title}\n${conflict.description}\n${JSON.stringify(conflict.evidence)}`.toLocaleLowerCase();
@@ -258,10 +266,6 @@ function validateQuestion(question: string): string {
   const trimmed = question.trim();
   if (trimmed.length > MAX_QUESTION_LENGTH) throw new Error(`Question must be at most ${MAX_QUESTION_LENGTH} characters.`);
   return trimmed;
-}
-
-function latestSnapshot(store: ObservatoryStore, projectId: string): Snapshot | undefined {
-  return store.snapshots.filter((snapshot) => snapshot.projectId === projectId).at(-1);
 }
 
 function expandedTerms(question: string): string[] {

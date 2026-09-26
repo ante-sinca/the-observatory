@@ -27,6 +27,43 @@ Observed projects
 
 ## Runtime responsibilities
 
+### v0.2D durable reads and Neon egress
+
+The production PostgreSQL store has two deliberately separate responsibilities:
+
+```text
+HTTP / MCP request
+  → PostgresReadService
+  → bounded, parameterized canonical PostgreSQL query
+  → response
+
+operator refresh / mutation
+  → explicit legacy mutation hydration
+  → deterministic array-backed pipeline
+  → transactional flush
+```
+
+`PostgresReadService` is the Vercel read boundary. It reads project summaries,
+latest snapshots, scoped knowledge/provenance, bounded movements/conflicts, and
+explicit artifact evidence directly from PostgreSQL. It does not populate the
+long-lived array model, so a warm serverless instance cannot serve stale memory
+after another instance commits data. The Vercel wrapper no longer calls
+`store.reload()`.
+
+`source_artifacts.content_text` is never part of generic hydration. Metadata
+queries omit it. The only body-bearing queries are scoped by project plus an
+artifact ID/exact path or the current repository revision, and carry a finite
+candidate limit. Artifact search returns at most 50 candidates and truncates
+each body to 32 KiB before deterministic scoring; evidence responses then use
+bounded line excerpts. This keeps Ask Project and Assistant value tracing
+evidence-correct without transferring the whole repository to Vercel.
+
+`GET /health` and `GET /api/assistant/health` are intentionally above this
+boundary and make zero Observatory database reads. Optional diagnostics use
+`OBSERVATORY_DB_DIAGNOSTICS=true` to log category, row count, approximate
+returned bytes, and whether an artifact body was requested. Logs never include
+content, query parameters, prompts, or credentials.
+
 ### Evidence, resolution and history
 
 Adapters capture immutable, source-addressable evidence. Knowledge and current

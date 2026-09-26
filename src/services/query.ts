@@ -78,6 +78,11 @@ export class ProjectQueryService {
     };
   }
 
+  getSources(projectRef: string): import("../domain/types.js").ProjectSource[] {
+    const project = this.getProject(projectRef);
+    return this.store.sources.filter((source) => source.projectId === project.id);
+  }
+
   getOnboardingSummary(projectRef: string): OnboardingSummary {
     const project = this.getProject(projectRef);
     const snapshot = this.latestSnapshot(project.id);

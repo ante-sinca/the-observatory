@@ -2,7 +2,8 @@ import { safeText } from "../core/security.js";
 import type { KnowledgeType, Movement, SourceArtifact } from "../domain/types.js";
 import { oauthScopeForTool } from "./oauth.js";
 import { AskProjectService } from "../services/ask-project.js";
-import { ProjectQueryService } from "../services/query.js";
+import type { ProjectSummary } from "../services/query.js";
+import { asReadService, type ObservatoryReadInput, type ObservatoryReadService } from "../services/read-service.js";
 
 export interface McpToolDefinition {
   name: string;
@@ -46,7 +47,11 @@ const MAX_EXCERPT_CHARACTERS = 6_000;
  * access source configuration or credentials.
  */
 export class ObservatoryToolService {
-  constructor(private readonly queries: ProjectQueryService, private readonly askProject?: AskProjectService, private readonly profile: "remote" | "local" = "remote") {}
+  private readonly queries: ObservatoryReadService;
+
+  constructor(queries: ObservatoryReadInput, private readonly askProject?: AskProjectService, private readonly profile: "remote" | "local" = "remote") {
+    this.queries = asReadService(queries);
+  }
 
   listTools(): McpToolDefinition[] {
     if (this.profile === "local") return this.localTools();
@@ -61,11 +66,11 @@ export class ObservatoryToolService {
     ];
   }
 
-  call(name: string, input: Record<string, unknown> = {}): unknown {
+  async call(name: string, input: Record<string, unknown> = {}): Promise<unknown> {
     if (this.profile === "local") return this.callLocal(name, input);
     switch (name) {
       case "list_projects":
-        return listProjectsForMcp(this.queries.listProjects());
+        return listProjectsForMcp(await this.queries.listProjects());
       case "get_project_state":
         return this.projectState(requiredProject(input));
       case "search_project":
@@ -98,7 +103,7 @@ export class ObservatoryToolService {
     ];
   }
 
-  private callLocal(name: string, input: Record<string, unknown>): unknown {
+  private async callLocal(name: string, input: Record<string, unknown>): Promise<unknown> {
     switch (name) {
       case "get_recent_changes": return this.queries.getRecentChanges(localRequiredString(input, "project"), localOptionalString(input, "since"));
       case "get_deployments": return this.queries.getDeployments(localRequiredString(input, "project"), localOptionalString(input, "environment"), localOptionalNumber(input, "limit"));
@@ -118,8 +123,8 @@ export class ObservatoryToolService {
     }
   }
 
-  private projectState(projectRef: string): unknown {
-    const state = this.stateFor(projectRef);
+  private async projectState(projectRef: string): Promise<unknown> {
+    const state = await this.stateFor(projectRef);
     return {
       project: { slug: state.project.slug, name: redacted(state.project.name, 160), status: state.project.status },
       current: state.snapshot ? {
@@ -136,12 +141,10 @@ export class ObservatoryToolService {
     };
   }
 
-  private searchProject(projectRef: string, query: string, limit: number): unknown {
-    const project = this.projectFor(projectRef);
-    const state = this.stateFor(project.id);
-    const currentIds = new Set(state.snapshot?.knowledgeItemIds ?? []);
-    const currentRecords = this.queries.searchProject(project.id, query, { limit: MAX_RESULTS })
-      .filter((record) => currentIds.has(record.item.id));
+  private async searchProject(projectRef: string, query: string, limit: number): Promise<unknown> {
+    const project = await this.projectFor(projectRef);
+    const state = await this.stateFor(project.id);
+    const currentRecords = await this.queries.searchProject(project.id, query, { limit: MAX_RESULTS });
     const records = currentRecords
       .slice(0, limit)
       .map((record) => ({
@@ -167,15 +170,15 @@ export class ObservatoryToolService {
     };
   }
 
-  private getEvidence(projectRef: string, artifactId: string): unknown {
-    const project = this.projectFor(projectRef);
-    const state = this.stateFor(project.id);
-    const scope = this.queries.sourceArtifactScope(project.id, artifactId);
+  private async getEvidence(projectRef: string, artifactId: string): Promise<unknown> {
+    const project = await this.projectFor(projectRef);
+    const state = await this.stateFor(project.id);
+    const scope = await this.queries.sourceArtifactScope(project.id, artifactId);
     if (scope === "other_project") throw new McpToolError("evidence_not_in_project");
     if (scope === "missing") throw new McpToolError("evidence_not_found");
     let artifact: Pick<SourceArtifact, "id" | "path" | "revision" | "contentHash" | "content">;
     try {
-      artifact = this.queries.getSourceArtifact(project.id, artifactId);
+      artifact = await this.queries.getSourceArtifact(project.id, artifactId);
     } catch {
       // An in-project artifact may still be unavailable because it is binary
       // or was excluded by the safe-ingestion policy.
@@ -185,9 +188,9 @@ export class ObservatoryToolService {
     return { project: redacted(project.slug, 160), ...boundedArtifact(artifact, 1, MAX_EXCERPT_LINES) };
   }
 
-  private getFileExcerpt(projectRef: string, path: string, startLine?: number, endLine?: number): unknown {
-    const project = this.projectFor(projectRef);
-    const artifact = this.queries.getCurrentSourceArtifactByPath(project.id, path);
+  private async getFileExcerpt(projectRef: string, path: string, startLine?: number, endLine?: number): Promise<unknown> {
+    const project = await this.projectFor(projectRef);
+    const artifact = await this.queries.getCurrentSourceArtifactByPath(project.id, path);
     if (!artifact) throw new McpToolError("evidence_not_found");
     const totalLines = (artifact.content ?? "").split("\n").length;
     const start = startLine ?? 1;
@@ -196,16 +199,16 @@ export class ObservatoryToolService {
     return { project: redacted(project.slug, 160), ...boundedArtifact(artifact, start, end) };
   }
 
-  private getRecentMovements(projectRef: string): unknown {
-    const project = this.projectFor(projectRef);
-    const state = this.stateFor(project.id);
-    const allMovements = this.queries.getRecentChanges(project.id);
+  private async getRecentMovements(projectRef: string): Promise<unknown> {
+    const project = await this.projectFor(projectRef);
+    const state = await this.stateFor(project.id);
+    const allMovements = await this.queries.getRecentChanges(project.id);
     const movements = allMovements.slice(0, MAX_MOVEMENTS).map(movementForMcp);
     return { project: redacted(project.slug, 160), repositoryRevision: optionalRedacted(state.snapshot?.repositoryRevision, 256), movements, truncated: allMovements.length > MAX_MOVEMENTS };
   }
 
   private async ask(projectRef: string, question: string): Promise<unknown> {
-    const project = this.projectFor(projectRef);
+    const project = await this.projectFor(projectRef);
     if (!this.askProject) throw new McpToolError("internal_error");
     const response = await this.askProject.ask(project.id, question);
     return {
@@ -236,16 +239,16 @@ export class ObservatoryToolService {
     };
   }
 
-  private projectFor(projectRef: string) {
-    try { return this.queries.getProject(projectRef); } catch { throw new McpToolError("project_not_found"); }
+  private async projectFor(projectRef: string) {
+    try { return await this.queries.getProject(projectRef); } catch { throw new McpToolError("project_not_found"); }
   }
 
-  private stateFor(projectRef: string) {
-    try { return this.queries.getProjectState(projectRef); } catch { throw new McpToolError("project_not_found"); }
+  private async stateFor(projectRef: string) {
+    try { return await this.queries.getProjectState(projectRef); } catch { throw new McpToolError("project_not_found"); }
   }
 }
 
-function listProjectsForMcp(projects: ReturnType<ProjectQueryService["listProjects"]>) {
+function listProjectsForMcp(projects: ProjectSummary[]) {
   const visible = projects.slice(0, 100).map((project) => ({
     id: redacted(project.id, 160),
     slug: redacted(project.slug, 160),

@@ -10,6 +10,7 @@ import { ObservatoryToolService } from "../mcp/tools.js";
 import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
 import { ProjectRegistry } from "../services/project-registry.js";
 import { ProjectQueryService } from "../services/query.js";
+import { PostgresReadService } from "../services/postgres-read-service.js";
 import { AskProjectService } from "../services/ask-project.js";
 import { runMigrations } from "../core/migrations.js";
 import type { ArtifactContent, DeploymentAdapter, DeploymentRecord, HealthResult, RefreshRun, Snapshot, SourceAdapter, SourceArtifact, SourceArtifactRef, SourceConfig, SourceRevision } from "../domain/types.js";
@@ -91,11 +92,14 @@ test("PostgreSQL artifact identity keeps shared Git blobs distinct by path", { s
   // leaves the original immutable snapshot and artifact provenance unchanged.
   const second = new PostgresStore(cipher, connectionString);
   await second.ready();
+  const secondReads = new PostgresReadService(second);
+  assert.equal((await secondReads.getProjectState(project.id)).snapshot?.id, initialSnapshotId);
+  await second.reload();
   const secondRefresh = new RefreshOrchestrator(second, adapters);
   const afterRestart = await secondRefresh.refresh(project.id);
   assert.equal(afterRestart.idempotent, true);
   assert.equal(second.artifacts.filter((artifact) => artifact.sourceId === source.id).length, 2);
-  assert.equal(new ProjectQueryService(second).getProjectState(project.id).snapshot?.id, initialSnapshotId);
+  assert.equal((await secondReads.getProjectState(project.id)).snapshot?.id, initialSnapshotId);
 
   // The durable store flush is one transaction. A source/project isolation
   // violation staged after a run and snapshot must roll the whole transition
@@ -112,10 +116,11 @@ test("PostgreSQL artifact identity keeps shared Git blobs distinct by path", { s
 
   const third = new PostgresStore(cipher, connectionString);
   await third.ready();
+  await third.reload();
   assert.equal(third.refreshRuns.filter((run) => run.projectId === project.id).length, persistedRunCount);
   assert.equal(third.snapshots.filter((snapshot) => snapshot.projectId === project.id).length, persistedSnapshotCount);
   assert.equal(third.artifacts.filter((artifact) => artifact.sourceId === source.id).length, persistedArtifactCount);
-  assert.equal(new ProjectQueryService(third).getProjectState(project.id).snapshot?.id, initialSnapshotId);
+  assert.equal((await new PostgresReadService(third).getProjectState(project.id)).snapshot?.id, initialSnapshotId);
   await third.close();
 });
 
@@ -141,10 +146,10 @@ test("PostgreSQL durable-store release gates", { skip: connectionString ? false 
   // A new store instance reads canonical state only from PostgreSQL.
   const second = new PostgresStore(cipher, connectionString);
   await second.ready();
-  const secondQueries = new ProjectQueryService(second);
-  const restored = secondQueries.getProjectState(project.id);
+  const secondQueries = new PostgresReadService(second);
+  const restored = await secondQueries.getProjectState(project.id);
   assert.equal(restored.snapshot?.id, initial.snapshot?.id);
-  assert.equal(secondQueries.searchProject(project.id, "evidence")[0]?.provenance[0]?.path, "README.md");
+  assert.equal((await secondQueries.searchProject(project.id, "evidence"))[0]?.provenance[0]?.path, "README.md");
   assert.equal(Object.isFrozen(restored.snapshot), true);
 
   // HTTP and HTTP MCP read that same newly hydrated service state.
@@ -159,7 +164,7 @@ test("PostgreSQL durable-store release gates", { skip: connectionString ? false 
     const state = await fetch(`http://127.0.0.1:${port}/api/projects/${project.slug}`).then(async (response) => ({ status: response.status, value: await response.json() }));
     assert.equal(state.status, 200);
     assert.equal((state.value as { snapshot?: { id?: string } }).snapshot?.id, initial.snapshot?.id);
-    assert.equal((tools.call("search_project", { project: project.id, query: "evidence" }) as { results: unknown[] }).results.length, 1);
+    assert.equal(((await tools.call("search_project", { project: project.id, query: "evidence" })) as { results: unknown[] }).results.length, 1);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
@@ -169,6 +174,7 @@ test("PostgreSQL durable-store release gates", { skip: connectionString ? false 
   // creates a second immutable snapshot without modifying the first.
   const third = new PostgresStore(cipher, connectionString);
   await third.ready();
+  await third.reload();
   const thirdRefresh = new RefreshOrchestrator(third, adapters);
   const duplicate = await thirdRefresh.refresh(project.id);
   assert.equal(duplicate.idempotent, true);
@@ -181,9 +187,11 @@ test("PostgreSQL durable-store release gates", { skip: connectionString ? false 
 
   const fourth = new PostgresStore(cipher, connectionString);
   await fourth.ready();
+  const fourthReads = new PostgresReadService(fourth);
+  assert.deepEqual((await fourthReads.getSnapshot(project.id, initial.snapshot!.id)).knowledgeItemIds, initial.snapshot!.knowledgeItemIds);
+  assert.ok((await fourthReads.compareSnapshots(project.id, initial.snapshot!.id, changed.snapshot!.id)).some((movement) => movement.movementType === "changed"));
+  await fourth.reload();
   const fourthQueries = new ProjectQueryService(fourth);
-  assert.deepEqual(fourthQueries.getSnapshot(project.id, initial.snapshot!.id).knowledgeItemIds, initial.snapshot!.knowledgeItemIds);
-  assert.ok(fourthQueries.compareSnapshots(project.id, initial.snapshot!.id, changed.snapshot!.id).some((movement) => movement.movementType === "changed"));
 
   // A second project cannot see the first project's data.
   const fourthRegistry = new ProjectRegistry(fourth, cipher);
@@ -207,8 +215,8 @@ test("PostgreSQL durable-store release gates", { skip: connectionString ? false 
 
   const fifth = new PostgresStore(cipher, connectionString);
   await fifth.ready();
-  const fifthQueries = new ProjectQueryService(fifth);
-  assert.ok(fifthQueries.getConflicts(project.id).some((conflict) => conflict.type === "source_unavailable"));
-  assert.ok(fifthQueries.searchProject(project.id, "updated evidence").length > 0);
+  const fifthQueries = new PostgresReadService(fifth);
+  assert.ok((await fifthQueries.getConflicts(project.id)).some((conflict) => conflict.type === "source_unavailable"));
+  assert.ok((await fifthQueries.searchProject(project.id, "updated evidence")).length > 0);
   await fifth.close();
 });

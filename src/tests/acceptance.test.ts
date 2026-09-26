@@ -182,13 +182,13 @@ test("MCP registry contains only documented read-only tools and delegates querie
   await refresh.refresh(project.id);
   const names = tools.listTools().map((tool) => tool.name);
   assert.deepEqual(names, ["list_projects", "get_project_state", "search_project", "get_evidence", "get_file_excerpt", "get_recent_movements", "ask_project"]);
-  assert.equal((tools.call("search_project", { project: project.id, query: "evidence" }) as { results: unknown[] }).results.length, 1);
+  assert.equal(((await tools.call("search_project", { project: project.id, query: "evidence" })) as { results: unknown[] }).results.length, 1);
   assert.equal(tools.listTools().every((tool) => tool.annotations.readOnlyHint && !tool.annotations.destructiveHint), true);
   assert.equal(names.some((name) => ["edit_file", "commit", "merge", "deploy", "execute_sql", "send_payment", "mutate_production"].includes(name)), false);
 
   const localTools = new ObservatoryToolService(queries, ask, "local");
   assert.deepEqual(localTools.listTools().map((tool) => tool.name), ["list_projects", "get_project_state", "search_project", "get_recent_changes", "get_deployments", "get_decisions", "get_known_risks", "get_knowledge_item", "compare_snapshots", "get_source_artifact", "ask_project"]);
-  assert.equal((localTools.call("search_project", { project: project.id, query: "evidence" }) as unknown[]).length, 1);
+  assert.equal(((await localTools.call("search_project", { project: project.id, query: "evidence" })) as unknown[]).length, 1);
 });
 
 test("HTTP project administration and read-only MCP discovery use the shared services", async () => {
@@ -426,8 +426,8 @@ test("failed first onboarding refresh preserves a retryable project and source",
 test("the Vercel adapter preserves the public route for the shared HTTP router", async () => {
   // The Vercel handler is intentionally a thin function, not a replacement
   // HTTP implementation. This uses Node's adapter shape to exercise its path
-  // restoration and pre-request state reload before the shared router handles
-  // /health.
+  // restoration while proving health remains independent of durable state
+  // hydration.
   const store = new MemoryStore();
   let reloads = 0;
   store.reload = async () => { reloads += 1; };
@@ -447,7 +447,7 @@ test("the Vercel adapter preserves the public route for the shared HTTP router",
     const health = await fetch(`http://127.0.0.1:${port}/api?__observatory_path=/health`);
     assert.equal(health.status, 200);
     assert.equal((await health.json() as { status: string }).status, "ok");
-    assert.equal(reloads, 2);
+    assert.equal(reloads, 0);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
