@@ -71,6 +71,27 @@ ingestion, and MCP continue normally. Do not set a localhost base URL for a
 production deployment. The current adapter has no streaming or conversational
 memory, and it intentionally provides no write or execution capability.
 
+#### Optional HomeGift value-tracing smoke test
+
+This is intentionally manual and is not part of CI. With a locally available
+Ollama/Qwen instance, a refreshed local HomeGift snapshot, and the environment
+above, run:
+
+```powershell
+$response = Invoke-RestMethod -Method Post -ContentType "application/json" `
+  -Uri "http://localhost:3000/api/projects/homegift/assistant" `
+  -Body '{"question":"How much is the platform fee?"}'
+$response | ConvertTo-Json -Depth 8
+```
+
+Inspect `answer`, `status`, `answerSufficiency`, `revision`, `evidence`, and
+`toolCalls`. `verified_current` does not by itself establish that a fee amount
+was found. If current evidence only propagates a field such as
+`platformFeeMinor`, expect `answerSufficiency: "incomplete"` and a response
+that says the amount/rule was not established. If a current literal or
+calculation is found, the response must retain its provenance. Never treat a
+model-supplied percentage or amount as evidence.
+
 ### Durable runtime and Vercel
 
 `POSTGRES_URL` is the provider-managed pooled Vercel/Neon runtime variable.

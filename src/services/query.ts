@@ -1,4 +1,5 @@
 import type { ObservatoryStore } from "../core/store.js";
+import { isAllowedArtifact } from "../core/security.js";
 import type { Conflict, Deployment, KnowledgeItem, KnowledgeType, KnowledgeWithProvenance, Movement, Project, Snapshot } from "../domain/types.js";
 
 export interface ProjectSummary {
@@ -198,6 +199,25 @@ export class ProjectQueryService {
       && candidate.content !== undefined
       && candidate.revision === revision);
     return artifact ? { id: artifact.id, path: artifact.path, revision: artifact.revision, contentHash: artifact.contentHash, content: artifact.content } : undefined;
+  }
+
+  /**
+   * Bounded deterministic scan over already-ingested, current safe artifacts.
+   * This is a query-service view of the immutable snapshot, not a second index
+   * or a source-provider read. It is used by the assistant's symbol tracing.
+   */
+  searchCurrentSourceArtifacts(projectRef: string, query: string, limit = 20): Array<Pick<import("../domain/types.js").SourceArtifact, "id" | "sourceId" | "path" | "revision" | "contentHash" | "content">> {
+    const project = this.getProject(projectRef);
+    const revision = this.latestSnapshot(project.id)?.repositoryRevision;
+    const terms = query.toLocaleLowerCase().split(/[^a-z0-9]+/).filter((term) => term.length > 1).slice(0, 8);
+    if (!revision || terms.length === 0) return [];
+    return this.store.artifacts
+      .filter((artifact) => artifact.projectId === project.id && artifact.revision === revision && artifact.content !== undefined && isAllowedArtifact(artifact.path))
+      .map((artifact) => ({ artifact, score: terms.reduce((total, term) => total + occurrences(`${artifact.path}\n${artifact.content}`.toLocaleLowerCase(), term), 0) }))
+      .filter((candidate) => candidate.score > 0)
+      .sort((left, right) => right.score - left.score || left.artifact.path.localeCompare(right.artifact.path))
+      .slice(0, Math.min(Math.max(limit, 1), 50))
+      .map(({ artifact }) => ({ id: artifact.id, sourceId: artifact.sourceId, path: artifact.path, revision: artifact.revision, contentHash: artifact.contentHash, content: artifact.content }));
   }
 
   getSnapshots(projectRef: string): Snapshot[] {

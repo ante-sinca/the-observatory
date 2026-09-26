@@ -10,6 +10,7 @@ import { ObservatoryAgentService } from "../intelligence/agent.js";
 import { intelligenceConfigFromEnvironment } from "../intelligence/config.js";
 import { OllamaProvider } from "../intelligence/ollama.js";
 import { IntelligenceProviderError, type IntelligenceCompletion, type IntelligenceCompletionRequest, type IntelligenceProvider } from "../intelligence/provider.js";
+import { classifyAssistantQuestion, evaluateAnswerSufficiency } from "../intelligence/sufficiency.js";
 import { ObservatoryToolService } from "../mcp/tools.js";
 import { AskProjectService } from "../services/ask-project.js";
 import { ProjectRegistry } from "../services/project-registry.js";
@@ -70,6 +71,26 @@ function setup(options: { health?: "healthy" | "degraded"; conflict?: boolean; c
 function agent(provider: IntelligenceProvider, options: { health?: "healthy" | "degraded"; conflict?: boolean; content?: string; maxToolCalls?: number } = {}) {
   const services = setup(options);
   return { ...services, agent: new ObservatoryAgentService(provider, services.queries, services.ask, { model: "qwen2.5:7b", maxToolCalls: options.maxToolCalls }) };
+}
+
+interface ValueSource { id: string; path: string; content: string; }
+
+function valueAgent(provider: IntelligenceProvider, sources: ValueSource[], options: { conflict?: boolean; maxToolCalls?: number } = {}) {
+  const store = new MemoryStore();
+  store.projects.push(project());
+  const items: KnowledgeItem[] = [];
+  for (const source of sources) {
+    store.artifacts.push({ id: source.id, projectId: "project-id", sourceId: "repository-source", externalId: source.id, path: source.path, artifactType: "text", revision: "revision-42", contentHash: `${source.id}-hash`, content: source.content, metadata: {}, firstSeenAt: observedAt, lastSeenAt: observedAt });
+    const item: KnowledgeItem = { id: `${source.id}-item`, projectId: "project-id", type: "implementation", title: `Platform fee evidence ${source.id}`, body: source.content, status: "current", state: { documented: "unknown", implemented: "evidenced", tested: "unknown", deployed: "unknown", observed: "unknown" }, fingerprint: source.id, entityKey: source.id, createdAt: observedAt };
+    items.push(item);
+    store.provenance.push({ id: `${source.id}-provenance`, knowledgeItemId: item.id, sourceArtifactId: source.id, sourceType: "repository", sourceRef: source.id, repositoryCommit: "revision-42", path: source.path, startLine: 1, endLine: 1, metadata: {} });
+  }
+  store.knowledge.push(...items);
+  store.snapshots.push({ id: "snapshot-42", projectId: "project-id", createdAt: observedAt, repositoryRevision: "revision-42", sourceHealth: { "repository-source": { state: "healthy", checkedAt: observedAt } }, summary: { knowledgeCount: items.length, byType: { implementation: items.length }, resolution: options.conflict ? "conflicted" : "resolved" }, knowledgeItemIds: items.map((item) => item.id) });
+  if (options.conflict) store.conflicts.push({ id: "platform-fee-conflict", projectId: "project-id", snapshotId: "snapshot-42", type: "evidence_mismatch", severity: "high", title: "Platform-fee values conflict", description: "Two current fee values disagree.", evidence: { key: "platformFeeMinor" }, status: "open" });
+  const queries = new ProjectQueryService(store);
+  const ask = new AskProjectService(store, queries);
+  return new ObservatoryAgentService(provider, queries, ask, { model: "qwen2.5:7b", maxToolCalls: options.maxToolCalls });
 }
 
 test("AI configuration is opt-in and malformed settings fail closed", () => {
@@ -168,6 +189,73 @@ test("prompt injection in retrieved repository evidence remains untrusted data",
   assert.doesNotMatch(result.answer, /fully verified/i);
 });
 
+test("value-question planning distinguishes a copied fee symbol from a value or rule", () => {
+  const copied = evaluateAnswerSufficiency("How much is the platform fee?", "verified_current", [{ evidence: { artifactId: "flow", path: "lib/payments/finalisation.ts", repositoryRevision: "revision-42", role: "runtime_implementation", reason: "current" }, excerpt: "const totalServiceFeeMinor = platformFeeMinor;" }]);
+  const literal = evaluateAnswerSufficiency("How much is the platform fee?", "verified_current", [{ evidence: { artifactId: "policy", path: "lib/payments/fees.ts", repositoryRevision: "revision-42", role: "runtime_implementation", reason: "current" }, excerpt: "export const platformFeeMinor = 200;" }]);
+  assert.equal(classifyAssistantQuestion("How much is the platform fee?"), "value_lookup");
+  assert.equal(classifyAssistantQuestion("Which tests cover this behaviour?"), "test_coverage");
+  assert.equal(classifyAssistantQuestion("What changed recently in this area?"), "recent_change");
+  assert.equal(copied.answerSufficiency, "incomplete");
+  assert.equal(literal.answerSufficiency, "sufficient");
+});
+
+test("current but incomplete platform-fee evidence triggers bounded value tracing", async () => {
+  const provider = new ScriptedProvider([response("The platform fee is 2%." )]);
+  const service = valueAgent(provider, [{ id: "flow", path: "lib/payments/finalisation.ts", content: "const totalServiceFeeMinor = platformFeeMinor;" }]);
+  const result = await service.answer("observed", "How much is the platform fee?");
+  assert.equal(result.status, "verified_current");
+  assert.equal(result.answerSufficiency, "incomplete");
+  assert.ok(result.toolCalls.some((call) => call.reason === "no_new_evidence"));
+  assert.doesNotMatch(result.answer, /2%/);
+  assert.match(result.answer, /does not establish/i);
+});
+
+test("value tracing returns a resolving rule with both original and resolving provenance", async () => {
+  const propagation = Array.from({ length: 8 }, (_, index) => ({ id: `flow-${index}`, path: `lib/payments/flow-${index}.ts`, content: "const totalServiceFeeMinor = platformFeeMinor;" }));
+  const service = valueAgent(new ScriptedProvider([]), [...propagation, { id: "resolver", path: "z-config/value.ts", content: "export const platformFeeMinor = 200;" }]);
+  const result = await service.answer("observed", "How much is the platform fee?");
+  assert.equal(result.answerSufficiency, "sufficient");
+  assert.match(result.answer, /200/);
+  assert.ok(result.evidence.some((evidence) => evidence.artifactId === "flow-0"));
+  assert.ok(result.evidence.some((evidence) => evidence.artifactId === "resolver"));
+  assert.ok(result.toolCalls.some((call) => (call.name === "ask_project" || call.name === "search_knowledge") && call.reason === "new_evidence_found"));
+});
+
+test("value trace exhaustion, conflicts, invented values, and tool limits remain controlled", async () => {
+  const source = [{ id: "flow", path: "lib/payments/finalisation.ts", content: "const totalServiceFeeMinor = platformFeeMinor;" }];
+  const exhausted = await valueAgent(new ScriptedProvider([response("The fee is 2%." )]), source).answer("observed", "How much is the platform fee?");
+  assert.equal(exhausted.answerSufficiency, "incomplete");
+  assert.doesNotMatch(exhausted.answer, /2%/);
+  assert.match(exhausted.answer, /does not establish/i);
+
+  const conflicted = await valueAgent(new ScriptedProvider([response("Choose 200." )]), [{ id: "policy", path: "lib/payments/fees.ts", content: "export const platformFeeMinor = 200;" }], { conflict: true }).answer("observed", "How much is the platform fee?");
+  assert.equal(conflicted.status, "conflicted");
+  assert.equal(conflicted.answerSufficiency, "conflicted");
+  assert.doesNotMatch(conflicted.answer, /Choose 200/);
+
+  const limited = await valueAgent(new ScriptedProvider([response("", [{ id: "extra", name: "get_current_snapshot", arguments: {} }])]), source, { maxToolCalls: 1 }).answer("observed", "How much is the platform fee?");
+  assert.equal(limited.answerSufficiency, "incomplete");
+  assert.equal(limited.toolCalls.at(-1)?.error, "tool_limit_reached");
+  assert.doesNotMatch(limited.answer, /2%|200/);
+});
+
+test("already-established values avoid unnecessary model retrieval", async () => {
+  const provider = new ScriptedProvider([]);
+  const result = await valueAgent(provider, [{ id: "policy", path: "lib/payments/fees.ts", content: "export const platformFeeMinor = 200;" }]).answer("observed", "How much is the platform fee?");
+  assert.equal(result.answerSufficiency, "sufficient");
+  assert.match(result.answer, /200/);
+  assert.equal(provider.requests.length, 0);
+  assert.deepEqual(result.toolCalls, []);
+});
+
+test("question intent regression coverage remains broad", () => {
+  assert.equal(classifyAssistantQuestion("Where is this value configured?"), "location_lookup");
+  assert.equal(classifyAssistantQuestion("How does this feature work?"), "implementation_explanation");
+  assert.equal(classifyAssistantQuestion("Where would I change this safely?"), "safe_change_location");
+  assert.equal(classifyAssistantQuestion("What is the timeout?"), "value_lookup");
+  assert.equal(classifyAssistantQuestion("What is the retry limit?"), "value_lookup");
+});
+
 test("disabled assistant endpoint is controlled and leaves Ask Project unchanged", async () => {
   const { store, queries, ask } = setup();
   const services = { registry: new ProjectRegistry(store, ConfigCipher.fromEnvironment()), refresh: new RefreshOrchestrator(store, new AdapterRegistry()), queries, ask, tools: new ObservatoryToolService(queries, ask) };
@@ -177,7 +265,9 @@ test("disabled assistant endpoint is controlled and leaves Ask Project unchanged
   try {
     const disabled = await fetch(`${origin}/api/projects/observed/assistant`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: "Where is the release flag configured?" }) });
     assert.equal(disabled.status, 503);
-    assert.equal((await disabled.json() as { availability: string }).availability, "unavailable");
+    const disabledBody = await disabled.json() as { availability: string; answerSufficiency: string };
+    assert.equal(disabledBody.availability, "unavailable");
+    assert.equal(disabledBody.answerSufficiency, "insufficient");
     const askResponse = await fetch(`${origin}/api/projects/observed/ask`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: "Where is the release flag configured?" }) });
     assert.equal(askResponse.status, 200);
     assert.equal((await askResponse.json() as { status: string }).status, "verified_current");
@@ -203,8 +293,9 @@ test("configured assistant endpoint returns the grounded structured contract", a
   try {
     const result = await fetch(`${origin}/api/projects/observed/assistant`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: "Where is the release flag configured?" }) });
     assert.equal(result.status, 200);
-    const body = await result.json() as { status: string; project: string; revision?: string; evidence: unknown[]; toolCalls: unknown[] };
+    const body = await result.json() as { status: string; answerSufficiency: string; project: string; revision?: string; evidence: unknown[]; toolCalls: unknown[] };
     assert.equal(body.status, "verified_current");
+    assert.equal(body.answerSufficiency, "sufficient");
     assert.equal(body.project, "observed");
     assert.equal(body.revision, "revision-42");
     assert.ok(body.evidence.length > 0);

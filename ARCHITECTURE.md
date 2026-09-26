@@ -1,4 +1,4 @@
-# Architecture — Project Observatory v0.2A
+# Architecture — Project Observatory v0.2A.1
 
 ## Components
 
@@ -97,6 +97,30 @@ The agent has bounded tool iterations, calls, evidence context, output excerpts,
 and provider timeout. Disabled, malformed, unreachable, timed-out, malformed,
 or invalid-tool provider interactions produce a controlled response without
 changing ingestion, HTTP reads, browser pages, MCP, or `AskProjectService`.
+
+### Answer sufficiency and value tracing
+
+v0.2A.1 separates two deterministic concepts that must not be conflated:
+
+- `status` says whether the selected Observatory evidence is current,
+  partial, conflicted, or absent.
+- `answerSufficiency` says whether that evidence resolves the user's actual
+  information need: `sufficient`, `incomplete`, `insufficient`, or
+  `conflicted`.
+
+For example, `verified_current` evidence that copies `platformFeeMinor` between
+payment records is genuine current evidence, yet has `answerSufficiency:
+incomplete` for “How much is the platform fee?” because it does not establish
+the amount or rule.
+
+The agent uses a lightweight code-governed question intent classifier. For
+value lookups it inspects bounded current excerpts for a direct literal/default,
+explicit waiver, or numeric calculation tied to the requested concept. A symbol
+reference, storage field, or propagation statement never establishes a value.
+When incomplete, it follows observed symbols with bounded `ask_project` and
+current-artifact query calls. It returns either the exact observed value/rule
+with provenance or an explicit “not established” response. Model prose cannot
+declare a value, status, or sufficiency on its own.
 
 ### Evidence policy
 

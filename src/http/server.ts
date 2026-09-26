@@ -108,6 +108,7 @@ async function route(request: IncomingMessage, response: ServerResponse, service
       return send(response, 503, {
         answer: "The Observatory assistant is not available. Deterministic Ask Project remains available.",
         status: "insufficient_evidence",
+        answerSufficiency: "insufficient",
         project: project.slug,
         evidence: [],
         toolCalls: [],

@@ -33,12 +33,13 @@ characters and returns an evidence-backed answer, current repository revision,
 provenance, explicit status, and relevant unresolved conflicts.
 
 `POST /api/projects/:projectId/assistant` accepts the same bounded body and is
-the optional v0.2A model interpretation endpoint. It returns:
+the optional v0.2A.1 model interpretation endpoint. It returns:
 
 ```json
 {
   "answer": "...",
   "status": "verified_current | partial | conflicted | insufficient_evidence",
+  "answerSufficiency": "sufficient | incomplete | insufficient | conflicted",
   "project": "project-slug",
   "revision": "observed-repository-revision",
   "evidence": [],
@@ -47,8 +48,14 @@ the optional v0.2A model interpretation endpoint. It returns:
 }
 ```
 
-`status`, `revision`, and `evidence` come from the deterministic
-`AskProjectService` anchor, not from the model. The endpoint uses the same
+`status`, `answerSufficiency`, `revision`, and `evidence` are code-governed,
+not model-selected. `status` describes the provenance/currentness of selected
+evidence. `answerSufficiency` separately states whether it establishes the
+fact requested by the question. Thus `verified_current` plus `incomplete` is a
+valid and important result for a value that is referenced but not assigned,
+calculated, configured, or otherwise established. Value tracing follows only
+bounded current Observatory evidence and returns a concise tool trace, never
+hidden model reasoning. The endpoint uses the same
 read-only HTTP convention as Ask Project; it never changes a project or an
 observed system. If AI is disabled, malformed, or unreachable it returns a
 generic controlled `503` response with `availability: "unavailable"`; it never
