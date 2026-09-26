@@ -25,11 +25,35 @@ administration remain separate HTTP-only operations protected by
 - `GET /api/projects/:projectId/search?q=...`
 - `GET /api/projects/:projectId/deployments`
 - `POST /api/projects/:projectId/ask`
+- `POST /api/projects/:projectId/assistant`
 
 `POST /api/projects/:projectId/ask` accepts `{ "question": "..." }` and is
 the same `AskProjectService` used by MCP. It is bounded to 2,000 question
 characters and returns an evidence-backed answer, current repository revision,
 provenance, explicit status, and relevant unresolved conflicts.
+
+`POST /api/projects/:projectId/assistant` accepts the same bounded body and is
+the optional v0.2A model interpretation endpoint. It returns:
+
+```json
+{
+  "answer": "...",
+  "status": "verified_current | partial | conflicted | insufficient_evidence",
+  "project": "project-slug",
+  "revision": "observed-repository-revision",
+  "evidence": [],
+  "toolCalls": [],
+  "availability": "available | unavailable"
+}
+```
+
+`status`, `revision`, and `evidence` come from the deterministic
+`AskProjectService` anchor, not from the model. The endpoint uses the same
+read-only HTTP convention as Ask Project; it never changes a project or an
+observed system. If AI is disabled, malformed, or unreachable it returns a
+generic controlled `503` response with `availability: "unavailable"`; it never
+exposes model configuration, base URLs, secrets, or transport details. This is
+not an MCP tool and does not alter the established MCP catalogue or scopes.
 
 ## Remote MCP
 

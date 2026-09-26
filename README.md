@@ -39,6 +39,38 @@ health probe. Start the same state service as an MCP stdio process with:
 node dist/index.js --mcp
 ```
 
+### Optional local Ollama / Qwen assistant
+
+Ollama is an operator-managed local dependency; Observatory neither installs,
+starts, nor deploys it. Install and run Ollama using its official instructions,
+then choose a Qwen model, for example:
+
+```powershell
+ollama pull qwen2.5:7b
+ollama serve
+$env:OBSERVATORY_AI_ENABLED = "true"
+$env:OBSERVATORY_AI_PROVIDER = "ollama"
+$env:OBSERVATORY_AI_MODEL = "qwen2.5:7b"
+$env:OBSERVATORY_AI_BASE_URL = "http://127.0.0.1:11434"
+$env:OBSERVATORY_AI_TIMEOUT_MS = "20000"
+node dist/index.js
+```
+
+After registering and refreshing a project, exercise the assistant with:
+
+```powershell
+Invoke-RestMethod -Method Post -ContentType "application/json" `
+  -Uri "http://localhost:3000/api/projects/<project>/assistant" `
+  -Body '{"question":"Where is this setting configured?"}'
+```
+
+Confirm that `status`, `revision`, and `evidence` identify the deterministic
+snapshot sources; model prose is interpretation only. With AI disabled (the
+default), this endpoint returns a controlled 503 while `/ask`, the browser,
+ingestion, and MCP continue normally. Do not set a localhost base URL for a
+production deployment. The current adapter has no streaming or conversational
+memory, and it intentionally provides no write or execution capability.
+
 ### Durable runtime and Vercel
 
 `POSTGRES_URL` is the provider-managed pooled Vercel/Neon runtime variable.

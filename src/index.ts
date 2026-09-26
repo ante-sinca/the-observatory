@@ -11,8 +11,12 @@ import { ProjectRegistry } from "./services/project-registry.js";
 import { ProjectQueryService } from "./services/query.js";
 import { AskProjectService } from "./services/ask-project.js";
 import { AdapterRegistry, RefreshOrchestrator } from "./services/refresh.js";
+import { ObservatoryAgentService } from "./intelligence/agent.js";
+import { intelligenceConfigFromEnvironment } from "./intelligence/config.js";
+import { OllamaProvider } from "./intelligence/ollama.js";
+import type { IntelligenceProvider } from "./intelligence/provider.js";
 
-export async function createObservatory(options: { store?: ObservatoryStore } = {}) {
+export async function createObservatory(options: { store?: ObservatoryStore; intelligenceProvider?: IntelligenceProvider } = {}) {
   const cipher = ConfigCipher.fromEnvironment();
   const store = options.store ?? (databaseUrlFromEnvironment() ? new PostgresStore(cipher) : process.env.NODE_ENV === "production" ? (() => { throw new Error("A provider-managed PostgreSQL connection is required in production (DATABASE_URL)."); })() : new MemoryStore());
   await store.ready();
@@ -21,9 +25,16 @@ export async function createObservatory(options: { store?: ObservatoryStore } = 
   const refresh = new RefreshOrchestrator(store, adapters);
   const queries = new ProjectQueryService(store);
   const ask = new AskProjectService(store, queries);
+  const intelligence = intelligenceConfigFromEnvironment();
+  const provider = intelligence.enabled
+    ? options.intelligenceProvider ?? new OllamaProvider({ baseUrl: intelligence.baseUrl!, timeoutMs: intelligence.timeoutMs! })
+    : undefined;
+  const agent = provider && intelligence.model
+    ? new ObservatoryAgentService(provider, queries, ask, { model: intelligence.model })
+    : undefined;
   const tools = new ObservatoryToolService(queries, ask);
   const stdioTools = new ObservatoryToolService(queries, ask, "local");
-  return { store, adapters, registry, refresh, queries, ask, tools, stdioTools };
+  return { store, adapters, registry, refresh, queries, ask, agent, intelligence, tools, stdioTools };
 }
 
 if (process.argv[1] && new URL(`file://${process.argv[1].replaceAll("\\", "/")}`).href === import.meta.url) {

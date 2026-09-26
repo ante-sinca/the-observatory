@@ -5,6 +5,7 @@ import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
 import { ProjectRegistry } from "../services/project-registry.js";
 import { ProjectQueryService } from "../services/query.js";
 import { AskProjectService } from "../services/ask-project.js";
+import { ObservatoryAgentService } from "../intelligence/agent.js";
 import { handleMcpRequest, type McpJsonRpcRequest } from "../mcp/server.js";
 import { MCP_READ_SCOPES, oauthMcpConfiguration, oauthScopeForTool, protectedResourceMetadata, verifyOAuthMcpAccessToken, type McpReadScope } from "../mcp/oauth.js";
 import { McpToolError, ObservatoryToolService } from "../mcp/tools.js";
@@ -18,6 +19,8 @@ export interface ObservatoryHttpServices {
   refresh: RefreshOrchestrator;
   queries: ProjectQueryService;
   ask: AskProjectService;
+  /** Optional: AI is deliberately absent when disabled or misconfigured. */
+  agent?: ObservatoryAgentService;
   tools: ObservatoryToolService;
 }
 
@@ -96,6 +99,23 @@ async function route(request: IncomingMessage, response: ServerResponse, service
   if (resource === "ask" && method === "POST" && segments.length === 4) {
     const body = await jsonBody(request, 12_000);
     return send(response, 200, await services.ask.ask(projectId, stringField(body, "question")));
+  }
+  if (resource === "assistant" && method === "POST" && segments.length === 4) {
+    const body = await jsonBody(request, 12_000);
+    const question = assistantQuestion(body);
+    if (!services.agent) {
+      const project = services.queries.getProject(projectId);
+      return send(response, 503, {
+        answer: "The Observatory assistant is not available. Deterministic Ask Project remains available.",
+        status: "insufficient_evidence",
+        project: project.slug,
+        evidence: [],
+        toolCalls: [],
+        availability: "unavailable",
+      });
+    }
+    const result = await services.agent.answer(projectId, question);
+    return send(response, result.availability === "available" ? 200 : 503, result);
   }
   if (resource === "sources" && method === "GET" && segments.length === 4) return send(response, 200, services.registry.getSources(projectId).map(publicSource));
   if (resource === "sources" && method === "POST" && segments.length === 4) {
@@ -511,6 +531,7 @@ async function refreshExistingProject(request: IncomingMessage, response: Server
 function publicSource(source: ProjectSource) { return { id: source.id, projectId: source.projectId, type: source.type, provider: source.provider, enabled: source.enabled, lastHealth: source.lastHealth, lastCheckedAt: source.lastCheckedAt }; }
 function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 function stringField(value: Record<string, unknown>, key: string): string { const field = value[key]; if (typeof field !== "string" || !field.trim()) throw new Error(`'${key}' must be a non-empty string.`); return field; }
+function assistantQuestion(value: Record<string, unknown>): string { const question = stringField(value, "question"); if (question.trim().length > 2_000) throw new Error("'question' must be at most 2000 characters."); return question; }
 function optionalStringField(value: Record<string, unknown>, key: string): string | undefined { const field = value[key]; if (field === undefined) return undefined; if (typeof field !== "string") throw new Error(`'${key}' must be a string.`); return field; }
 function optionalBooleanField(value: Record<string, unknown>, key: string): boolean | undefined { const field = value[key]; if (field === undefined) return undefined; if (typeof field !== "boolean") throw new Error(`'${key}' must be a boolean.`); return field; }
 function recordField(value: Record<string, unknown>, key: string): Record<string, unknown> { const field = value[key]; if (!isRecord(field)) throw new Error(`'${key}' must be an object.`); return field; }
