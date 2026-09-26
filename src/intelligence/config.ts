@@ -32,6 +32,11 @@ export function intelligenceConfigFromEnvironment(environment: Environment = pro
   return { enabled: true, provider, model, baseUrl: canonicalBaseUrl(baseUrl), timeoutMs };
 }
 
+/** UI exposure is deliberately independent from provider configuration. */
+export function assistantUiEnabledFromEnvironment(environment: Environment = process.env): boolean {
+  return environment.OBSERVATORY_ASSISTANT_UI_ENABLED === "true";
+}
+
 function validModel(value: string | undefined): value is string {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(value);
 }

@@ -5,7 +5,7 @@ import { AdapterRegistry, RefreshOrchestrator } from "../services/refresh.js";
 import { ProjectRegistry } from "../services/project-registry.js";
 import { ProjectQueryService } from "../services/query.js";
 import { AskProjectService } from "../services/ask-project.js";
-import { ObservatoryAgentService } from "../intelligence/agent.js";
+import { ObservatoryAgentService, type AssistantConversationContext } from "../intelligence/agent.js";
 import { handleMcpRequest, type McpJsonRpcRequest } from "../mcp/server.js";
 import { MCP_READ_SCOPES, oauthMcpConfiguration, oauthScopeForTool, protectedResourceMetadata, verifyOAuthMcpAccessToken, type McpReadScope } from "../mcp/oauth.js";
 import { McpToolError, ObservatoryToolService } from "../mcp/tools.js";
@@ -21,6 +21,8 @@ export interface ObservatoryHttpServices {
   ask: AskProjectService;
   /** Optional: AI is deliberately absent when disabled or misconfigured. */
   agent?: ObservatoryAgentService;
+  /** Browser-only exposure is opt-in even when the optional API is composed. */
+  assistantUiEnabled?: boolean;
   tools: ObservatoryToolService;
 }
 
@@ -71,6 +73,10 @@ async function route(request: IncomingMessage, response: ServerResponse, service
   if (method === "GET" && browserSegments[0] === "projects" && browserSegments[1] && browserSegments.length <= 3) {
     const page = browserSegments[2] ?? "overview";
     const csrf = issueCsrfToken(request);
+    if (page === "assistant" && !services.assistantUiEnabled) {
+      const project = services.queries.getProject(browserSegments[1]);
+      return sendHtml(response, assistantUnavailableScreen(project.slug, project.name), 503, csrf.headers);
+    }
     return sendHtml(response, projectScreen(services, browserSegments[1], page, url.searchParams.get("onboarding") === "complete", csrf.token, hasOnboardingOperatorAccess(request)), 200, csrf.headers);
   }
   if (path === "/mcp") return handleRemoteMcp(request, response, services);
@@ -115,7 +121,7 @@ async function route(request: IncomingMessage, response: ServerResponse, service
         availability: "unavailable",
       });
     }
-    const result = await services.agent.answer(projectId, question);
+    const result = await services.agent.answer(projectId, question, assistantConversation(body));
     return send(response, result.availability === "available" ? 200 : 503, result);
   }
   if (resource === "sources" && method === "GET" && segments.length === 4) return send(response, 200, services.registry.getSources(projectId).map(publicSource));
@@ -533,6 +539,21 @@ function publicSource(source: ProjectSource) { return { id: source.id, projectId
 function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 function stringField(value: Record<string, unknown>, key: string): string { const field = value[key]; if (typeof field !== "string" || !field.trim()) throw new Error(`'${key}' must be a non-empty string.`); return field; }
 function assistantQuestion(value: Record<string, unknown>): string { const question = stringField(value, "question"); if (question.trim().length > 2_000) throw new Error("'question' must be at most 2000 characters."); return question; }
+/** Accept only small untrusted follow-up wording and path references, never agent prose or artifact content. */
+function assistantConversation(value: Record<string, unknown>): AssistantConversationContext {
+  const conversation = value.conversation;
+  if (!isRecord(conversation)) return {};
+  const referencedConcept = boundedConversationString(conversation.referencedConcept, 160);
+  const referencedPaths = boundedConversationStrings(conversation.referencedPaths, 6, 512);
+  const recentUserMessages = boundedConversationStrings(conversation.recentUserMessages, 4, 400);
+  return {
+    ...(referencedConcept ? { referencedConcept } : {}),
+    ...(referencedPaths.length ? { referencedPaths } : {}),
+    ...(recentUserMessages.length ? { recentUserMessages } : {}),
+  };
+}
+function boundedConversationString(value: unknown, maximum: number): string | undefined { return typeof value === "string" && value.trim().length > 0 ? value.trim().slice(0, maximum) : undefined; }
+function boundedConversationStrings(value: unknown, maximumItems: number, maximumLength: number): string[] { return Array.isArray(value) ? value.flatMap((item) => boundedConversationString(item, maximumLength) ?? []).slice(0, maximumItems) : []; }
 function optionalStringField(value: Record<string, unknown>, key: string): string | undefined { const field = value[key]; if (field === undefined) return undefined; if (typeof field !== "string") throw new Error(`'${key}' must be a string.`); return field; }
 function optionalBooleanField(value: Record<string, unknown>, key: string): boolean | undefined { const field = value[key]; if (field === undefined) return undefined; if (typeof field !== "boolean") throw new Error(`'${key}' must be a boolean.`); return field; }
 function recordField(value: Record<string, unknown>, key: string): Record<string, unknown> { const field = value[key]; if (!isRecord(field)) throw new Error(`'${key}' must be an object.`); return field; }
@@ -550,7 +571,8 @@ function projectScreen(services: ObservatoryHttpServices, projectRef: string, pa
   const state = services.queries.getProjectState(projectRef);
   const project = state.project;
   const base = `/projects/${encodeURIComponent(project.slug)}`;
-  const nav = ["overview", "state", "knowledge", "movements", "sources", "ask"].map((item) => `<a class="${page === item ? "active" : ""}" href="${base}${item === "overview" ? "" : `/${item}`}">${item.replace(/^./, (char) => char.toUpperCase())}</a>`).join("");
+  const navItems = ["overview", "state", "knowledge", "movements", "sources", "ask", ...(services.assistantUiEnabled ? ["assistant"] : [])];
+  const nav = navItems.map((item) => `<a class="${page === item ? "active" : ""}" href="${base}${item === "overview" ? "" : `/${item}`}">${item.replace(/^./, (char) => char.toUpperCase())}</a>`).join("");
   let content: string;
   switch (page) {
     case "overview": content = `${onboardingComplete ? onboardingSuccess(services.queries.getOnboardingSummary(project.id), project.name) : ""}<h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.description ?? "No project description.")}</p><section><h2>Current snapshot</h2><dl><dt>Repository head</dt><dd>${escapeHtml(state.snapshot?.repositoryRevision ?? "Unknown")}</dd><dt>Production deployment</dt><dd>${escapeHtml(state.snapshot?.deploymentRevision ?? "Unknown")}</dd><dt>Knowledge items</dt><dd>${state.summary?.knowledgeCount ?? 0}</dd><dt>Resolution</dt><dd>${escapeHtml(state.summary?.resolution ?? "No snapshot")}</dd></dl></section><section><h2>Unresolved conflicts</h2>${list(state.unresolvedConflicts.map((conflict) => `${conflict.severity}: ${conflict.title}`))}</section><section><h2>Recent movements</h2>${list(state.latestMovements.slice(0, 8).map((movement) => `${movement.movementType}: ${movement.entityKey}`))}</section>`; break;
@@ -559,6 +581,7 @@ function projectScreen(services: ObservatoryHttpServices, projectRef: string, pa
     case "movements": content = `<h1>Movements</h1>${list(services.queries.getRecentChanges(project.id).map((movement) => `${movement.createdAt}: ${movement.movementType} ${movement.entityKey}`))}`; break;
     case "sources": content = sourcesScreen(project.slug, services.registry.getSources(project.id), csrf, canOperate); break;
     case "ask": content = askScreen(project.slug, project.name, services.queries.listProjects()); break;
+    case "assistant": content = assistantScreen(project.slug, project.name, services.queries.listProjects(), Boolean(services.agent)); break;
     default: throw new Error("Browser page not found.");
   }
   return layout(`${project.name} — Project Observatory`, `<nav class="project-nav">${nav}</nav>${content}`);
@@ -596,6 +619,50 @@ function askScreen(slug: string, name: string, projects: ReturnType<ProjectQuery
 </script>`;
 }
 
+/**
+ * A deliberately small browser client: the transcript and follow-up hints
+ * live only in this page's JavaScript memory. The server receives bounded,
+ * untrusted linguistic context and always re-grounds a substantive answer.
+ */
+function assistantScreen(slug: string, name: string, projects: ReturnType<ProjectQueryService["listProjects"]>, initiallyAvailable: boolean): string {
+  const options = projects.map((project) => `<option value="${escapeHtml(project.slug)}"${project.slug === slug ? " selected" : ""}>${escapeHtml(project.name)}</option>`).join("");
+  const suggestions = ["Where is this value configured?", "How does this feature work?", "Which tests cover this behaviour?", "Where would I change this safely?", "What changed recently in this area?"];
+  const askHref = `/projects/${encodeURIComponent(slug)}/ask`;
+  return `<h1>Assistant — ${escapeHtml(name)}</h1><p class="project-label">Project: <strong>${escapeHtml(name)}</strong></p><p id="assistant-availability" class="${initiallyAvailable ? "notice success" : "notice error"}">Assistant availability: <strong>${initiallyAvailable ? "Available" : "Unavailable"}</strong>${initiallyAvailable ? "" : ". Use Ask Project for deterministic evidence lookup."}</p><p>Conversational, evidence-grounded reasoning for this project. For a deterministic evidence lookup, use <a href="${askHref}">Ask Project</a>.</p><label for="assistant-project">Project selector<select id="assistant-project" aria-label="Project selector">${options}</select></label><section id="assistant-conversation" class="wide conversation" aria-live="polite"></section><form id="assistant-form"><label for="assistant-question">Ask the assistant about ${escapeHtml(name)}<textarea id="assistant-question" name="question" maxlength="2000" required placeholder="Where is this value configured?"></textarea></label><button type="submit">Ask Assistant</button></form><section class="wide"><h2>Suggested questions</h2><p>${suggestions.map((suggestion) => `<button class="suggestion" type="button" data-question="${escapeHtml(suggestion)}">${escapeHtml(suggestion)}</button>`).join("")}</p></section><script>
+(() => {
+  const slug=${JSON.stringify(slug)};
+  const form=document.querySelector('#assistant-form');
+  const input=document.querySelector('#assistant-question');
+  const transcript=document.querySelector('#assistant-conversation');
+  const selector=document.querySelector('#assistant-project');
+  // Ephemeral, bounded linguistic context only: it is not an evidence cache or
+  // persisted conversation. Evidence is fetched again for every answer.
+  const context={referencedConcept:'',referencedPaths:[],recentUserMessages:[]};
+  const add=(parent,tag,value,className) => { const element=document.createElement(tag); if(className) element.className=className; element.textContent=String(value || ''); parent.appendChild(element); return element; };
+  const detail=(parent,summary) => { const node=document.createElement('details'); const label=document.createElement('summary'); label.textContent=summary; node.appendChild(label); parent.appendChild(node); return node; };
+  const lineLabel=(item) => item.startLine ? 'lines ' + item.startLine + (item.endLine && item.endLine !== item.startLine ? '–' + item.endLine : '') : 'line unavailable';
+  const resetConversation=() => { context.referencedConcept=''; context.referencedPaths=[]; context.recentUserMessages=[]; transcript.replaceChildren(); const welcome=document.createElement('article'); add(welcome,'strong','Observatory Assistant'); add(welcome,'p','Each answer is freshly grounded in this project’s current indexed evidence. Conversation context is limited to follow-up wording and is never stored.'); transcript.appendChild(welcome); };
+  const conceptFrom=(question) => {
+    const candidate=question.replace(/[?!.]+$/,'').replace(/^(where|how|which|what|can|could)\\b.*?\\b(is|are|does|do|would|will|can)\\b\\s+/i,'').replace(/^(the|this|that)\\s+/i,'').replace(/\\b(configured|implemented|covered|work|works|changed recently)\\b/gi,'').replace(/\\s+/g,' ').trim();
+    return candidate.length >= 2 && candidate.length <= 160 ? candidate : context.referencedConcept;
+  };
+  const remember=(question,data) => { context.recentUserMessages=[...context.recentUserMessages,question.trim().slice(0,400)].slice(-4); context.referencedConcept=conceptFrom(question); context.referencedPaths=(Array.isArray(data.evidence) ? data.evidence : []).map((item) => typeof item.path === 'string' ? item.path : '').filter(Boolean).slice(0,6); };
+  const showEvidence=(parent,evidence) => { const panel=detail(parent,'Evidence'); if(!evidence.length) { add(panel,'p','No matching current evidence was returned.'); return; } const list=document.createElement('ul'); evidence.forEach((item) => { const row=document.createElement('li'); add(row,'strong',(item.role || 'evidence').replaceAll('_',' ')); add(row,'div',item.path || 'Path unavailable'); add(row,'div',lineLabel(item),'muted'); add(row,'div','Reason: ' + (item.reason || 'Not supplied')); list.appendChild(row); }); panel.appendChild(list); };
+  const showToolCalls=(parent,calls) => { const panel=detail(parent,'Retrieval activity'); if(!calls.length) { add(panel,'p','No additional assistant tool calls were required.'); return; } const list=document.createElement('ul'); calls.forEach((call) => { const row=document.createElement('li'); add(row,'strong',call.name || 'tool'); add(row,'div','Outcome: ' + (call.outcome || 'unknown')); if(call.reason || call.retrievalReason) add(row,'div','Reason: ' + (call.reason || call.retrievalReason)); if(call.error) add(row,'div','Error: ' + call.error,'muted'); if(call.input) add(row,'pre',JSON.stringify(call.input)); list.appendChild(row); }); panel.appendChild(list); };
+  const render=(data) => { const entry=document.createElement('article'); entry.className='wide assistant-answer'; add(entry,'strong','Observatory Assistant'); if(data.availability === 'unavailable') add(entry,'p','Assistant reasoning is currently unavailable. Deterministic Observatory evidence, when present, is shown below.','notice error'); add(entry,'p',data.answer || 'No assistant answer was returned.'); const metadata=document.createElement('dl'); const status=add(metadata,'dd',data.status || 'unavailable','badge'); const statusLabel=document.createElement('dt'); statusLabel.textContent='Evidence status'; metadata.insertBefore(statusLabel,status); const sufficiency=add(metadata,'dd',data.answerSufficiency || 'insufficient','badge'); const sufficiencyLabel=document.createElement('dt'); sufficiencyLabel.textContent='Answer sufficiency'; metadata.insertBefore(sufficiencyLabel,sufficiency); const revision=add(metadata,'dd',data.revision || 'Unavailable'); const revisionLabel=document.createElement('dt'); revisionLabel.textContent='Repository revision'; metadata.insertBefore(revisionLabel,revision); entry.appendChild(metadata); showEvidence(entry,Array.isArray(data.evidence) ? data.evidence : []); showToolCalls(entry,Array.isArray(data.toolCalls) ? data.toolCalls : []); transcript.appendChild(entry); };
+  selector.addEventListener('change', () => { resetConversation(); window.location.assign('/projects/' + encodeURIComponent(selector.value) + '/assistant'); });
+  document.querySelectorAll('[data-question]').forEach((button) => button.addEventListener('click', () => { input.value=button.dataset.question || ''; input.focus(); }));
+  form.addEventListener('submit', async (event) => { event.preventDefault(); const question=input.value.trim(); if(!question) return; const user=document.createElement('article'); user.className='wide assistant-question'; add(user,'strong','You'); add(user,'p',question); transcript.appendChild(user); input.value=''; const pending=document.createElement('article'); pending.className='wide muted'; add(pending,'p','Grounding a fresh answer in the current indexed evidence…'); transcript.appendChild(pending); try { const response=await fetch('/api/projects/' + encodeURIComponent(slug) + '/assistant',{method:'POST',headers:{'content-type':'application/json','accept':'application/json'},body:JSON.stringify({question,conversation:{referencedConcept:context.referencedConcept,referencedPaths:context.referencedPaths.slice(0,6),recentUserMessages:context.recentUserMessages.slice(-4)}})}); const data=await response.json(); pending.remove(); if(!response.ok && !data.answer) throw new Error(data.error || 'Assistant request failed.'); remember(question,data); render(data); } catch(error) { pending.remove(); const failure=document.createElement('article'); failure.className='wide notice error'; add(failure,'strong','Assistant unavailable'); add(failure,'p',error instanceof Error ? error.message : 'Assistant request failed. Use Ask Project for deterministic evidence lookup.'); const link=document.createElement('a'); link.href=${JSON.stringify(askHref)}; link.textContent='Open Ask Project'; failure.appendChild(link); transcript.appendChild(failure); } });
+  resetConversation();
+})();
+</script>`;
+}
+
+function assistantUnavailableScreen(slug: string, name: string): string {
+  const askHref = `/projects/${encodeURIComponent(slug)}/ask`;
+  return layout(`Assistant unavailable — ${name}`, `<h1>Assistant unavailable</h1><p>The conversational Assistant page is disabled for this deployment. Deterministic Ask Project remains available.</p><p><a class="button" href="${askHref}">Open Ask Project for ${escapeHtml(name)}</a></p>`);
+}
+
 function operatorSignIn(csrf: string, message?: string): string { return layout("Operator sign-in — Project Observatory", `<h1>Operator authorization required</h1><p>Enter the existing Observatory operator token to start a short-lived, same-site session for project onboarding.</p>${message ? `<p class="notice error">${escapeHtml(message)}</p>` : ""}<form method="post" action="/projects/new/auth"><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"><label>Operator token<input name="operatorToken" type="password" required autocomplete="current-password"></label><button type="submit">Authorize onboarding</button></form>`); }
 
 function onboardingForm(csrf: string, values: Partial<Omit<OnboardingFields, "token">> = {}, message?: string): string {
@@ -620,5 +687,5 @@ function sourcesScreen(slug: string, sources: ProjectSource[], csrf: string, can
 
 function list(values: string[]): string { return values.length ? `<ul>${values.map((value) => `<li>${escapeHtml(value)}</li>`).join("")}</ul>` : "<p>None.</p>"; }
 function json(value: unknown): string { return `<pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre>`; }
-function layout(title: string, content: string): string { return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font:16px system-ui;max-width:960px;margin:3rem auto;padding:0 1rem;background:#08111b;color:#e8f0f7}article,section,fieldset{display:inline-block;vertical-align:top;width:260px;min-height:150px;margin:0 1rem 1rem 0;padding:1.25rem;background:#122232;border:1px solid #28465e;border-radius:12px;box-sizing:border-box}section{width:calc(50% - 3rem)}section.wide{width:100%}h1{font-size:2rem}h2{margin-top:0}dt{color:#9eb6ca}dd{margin:0 0 .7rem}code,a{color:#7cdbff}a{font-weight:600}.button,button{display:inline-block;border:0;border-radius:6px;padding:.55rem .8rem;background:#1d6888;color:#fff;font:inherit;font-weight:700;cursor:pointer;text-decoration:none;margin:.35rem .35rem .35rem 0}.site-nav,.project-nav{display:flex;gap:1rem;margin:1.25rem 0}.site-nav{margin-top:0;padding-bottom:1rem;border-bottom:1px solid #28465e}.project-nav .active{color:#fff;text-decoration-thickness:3px}form{margin:.75rem 0}label{display:block;margin:.7rem 0;font-weight:600}input,textarea,select{box-sizing:border-box;display:block;width:100%;margin-top:.25rem;padding:.55rem;border:1px solid #517089;border-radius:6px;background:#07131f;color:#e8f0f7;font:inherit}textarea{min-height:5rem}.notice{padding:1rem;border-radius:8px}.notice.success{background:#113c2e;border:1px solid #277653}.notice.error{background:#481f29;border:1px solid #a14055}.muted{color:#9eb6ca}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#122232;padding:1rem;border-radius:8px}li{margin:.5rem 0}@media(max-width:640px){section,article,fieldset{width:100%;margin-right:0}.site-nav,.project-nav{flex-wrap:wrap}}</style><nav class="site-nav" aria-label="Primary"><a href="/">Home</a><a href="/projects">Projects</a></nav>${content}</html>`; }
+function layout(title: string, content: string): string { return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font:16px system-ui;max-width:960px;margin:3rem auto;padding:0 1rem;background:#08111b;color:#e8f0f7}article,section,fieldset{display:inline-block;vertical-align:top;width:260px;min-height:150px;margin:0 1rem 1rem 0;padding:1.25rem;background:#122232;border:1px solid #28465e;border-radius:12px;box-sizing:border-box}section{width:calc(50% - 3rem)}section.wide,article.wide{width:100%}.conversation article{display:block}h1{font-size:2rem}h2{margin-top:0}dt{color:#9eb6ca}dd{margin:0 0 .7rem}code,a{color:#7cdbff}a{font-weight:600}.button,button{display:inline-block;border:0;border-radius:6px;padding:.55rem .8rem;background:#1d6888;color:#fff;font:inherit;font-weight:700;cursor:pointer;text-decoration:none;margin:.35rem .35rem .35rem 0}.site-nav,.project-nav{display:flex;gap:1rem;margin:1.25rem 0}.site-nav{margin-top:0;padding-bottom:1rem;border-bottom:1px solid #28465e}.project-nav .active{color:#fff;text-decoration-thickness:3px}form{margin:.75rem 0}label{display:block;margin:.7rem 0;font-weight:600}input,textarea,select{box-sizing:border-box;display:block;width:100%;margin-top:.25rem;padding:.55rem;border:1px solid #517089;border-radius:6px;background:#07131f;color:#e8f0f7;font:inherit}textarea{min-height:5rem}.notice{padding:1rem;border-radius:8px}.notice.success{background:#113c2e;border:1px solid #277653}.notice.error{background:#481f29;border:1px solid #a14055}.muted{color:#9eb6ca}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#122232;padding:1rem;border-radius:8px}li{margin:.5rem 0}@media(max-width:640px){section,article,fieldset{width:100%;margin-right:0}.site-nav,.project-nav{flex-wrap:wrap}}</style><nav class="site-nav" aria-label="Primary"><a href="/">Home</a><a href="/projects">Projects</a></nav>${content}</html>`; }
 function escapeHtml(value: string): string { return value.replace(/[&<>\"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[character] ?? character); }

@@ -33,7 +33,24 @@ characters and returns an evidence-backed answer, current repository revision,
 provenance, explicit status, and relevant unresolved conflicts.
 
 `POST /api/projects/:projectId/assistant` accepts the same bounded body and is
-the optional v0.2A.1 model interpretation endpoint. It returns:
+the optional v0.2B model interpretation endpoint. It may additionally accept
+an optional browser-only `conversation` object:
+
+```json
+{
+  "question": "Which tests cover it?",
+  "conversation": {
+    "referencedConcept": "release flag",
+    "referencedPaths": ["src/config/release-flags.ts"],
+    "recentUserMessages": ["Where is the release flag configured?"]
+  }
+}
+```
+
+The server accepts at most one 160-character concept, six 512-character paths,
+and four 400-character user messages. This object is untrusted linguistic
+context only: it is not persisted, returned as evidence, or used to bypass the
+fresh deterministic Ask Project grounding pass. It returns:
 
 ```json
 {
@@ -61,6 +78,12 @@ observed system. If AI is disabled, malformed, or unreachable it returns a
 generic controlled `503` response with `availability: "unavailable"`; it never
 exposes model configuration, base URLs, secrets, or transport details. This is
 not an MCP tool and does not alter the established MCP catalogue or scopes.
+
+The opt-in browser page is `GET /projects/:projectId/assistant`. It is exposed
+only when `OBSERVATORY_ASSISTANT_UI_ENABLED=true`; otherwise the Assistant nav
+is hidden and direct browser navigation returns a controlled 503 page with a
+link to `/projects/:projectId/ask`. This browser gate does not grant provider
+access, change the API contract, or add conversational state to MCP.
 
 ## Remote MCP
 

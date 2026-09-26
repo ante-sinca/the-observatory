@@ -7,7 +7,7 @@ import { ConfigCipher } from "../core/security.js";
 import type { Conflict, KnowledgeItem, Project, Snapshot, SourceArtifact } from "../domain/types.js";
 import { createHttpServer } from "../http/server.js";
 import { ObservatoryAgentService } from "../intelligence/agent.js";
-import { intelligenceConfigFromEnvironment } from "../intelligence/config.js";
+import { assistantUiEnabledFromEnvironment, intelligenceConfigFromEnvironment } from "../intelligence/config.js";
 import { OllamaProvider } from "../intelligence/ollama.js";
 import { IntelligenceProviderError, type IntelligenceCompletion, type IntelligenceCompletionRequest, type IntelligenceProvider } from "../intelligence/provider.js";
 import { classifyAssistantQuestion, evaluateAnswerSufficiency } from "../intelligence/sufficiency.js";
@@ -98,6 +98,9 @@ test("AI configuration is opt-in and malformed settings fail closed", () => {
   assert.deepEqual(intelligenceConfigFromEnvironment({ OBSERVATORY_AI_ENABLED: "perhaps" }), { enabled: false, reason: "invalid_configuration" });
   assert.deepEqual(intelligenceConfigFromEnvironment({ OBSERVATORY_AI_ENABLED: "true", OBSERVATORY_AI_PROVIDER: "openai", OBSERVATORY_AI_MODEL: "qwen2.5:7b" }), { enabled: false, reason: "invalid_configuration" });
   assert.deepEqual(intelligenceConfigFromEnvironment({ OBSERVATORY_AI_ENABLED: "true", OBSERVATORY_AI_PROVIDER: "ollama", OBSERVATORY_AI_MODEL: "qwen2.5:7b", OBSERVATORY_AI_BASE_URL: "http://localhost:11434/", OBSERVATORY_AI_TIMEOUT_MS: "1234" }), { enabled: true, provider: "ollama", model: "qwen2.5:7b", baseUrl: "http://localhost:11434", timeoutMs: 1234 });
+  assert.equal(assistantUiEnabledFromEnvironment({}), false);
+  assert.equal(assistantUiEnabledFromEnvironment({ OBSERVATORY_ASSISTANT_UI_ENABLED: "true" }), true);
+  assert.equal(assistantUiEnabledFromEnvironment({ OBSERVATORY_ASSISTANT_UI_ENABLED: "TRUE" }), false);
 });
 
 test("OllamaProvider converts valid completions and tool calls without leaking vendor types", async () => {
@@ -291,7 +294,7 @@ test("configured assistant endpoint returns the grounded structured contract", a
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   try {
-    const result = await fetch(`${origin}/api/projects/observed/assistant`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: "Where is the release flag configured?" }) });
+    const result = await fetch(`${origin}/api/projects/observed/assistant`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question: "Where is the release flag configured?", conversation: { referencedConcept: "release flag", referencedPaths: ["src/config/release-flags.ts"], recentUserMessages: ["Where is the release flag configured?"] } }) });
     assert.equal(result.status, 200);
     const body = await result.json() as { status: string; answerSufficiency: string; project: string; revision?: string; evidence: unknown[]; toolCalls: unknown[] };
     assert.equal(body.status, "verified_current");
@@ -300,6 +303,73 @@ test("configured assistant endpoint returns the grounded structured contract", a
     assert.equal(body.revision, "revision-42");
     assert.ok(body.evidence.length > 0);
     assert.deepEqual(body.toolCalls, []);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("assistant follow-ups are freshly grounded and conversation hints remain untrusted", async () => {
+  const provider = new ScriptedProvider([
+    response("The release flag is in the observed configuration source."),
+    response("No current test evidence was selected for that configuration."),
+  ]);
+  const { agent: service } = agent(provider);
+  await service.answer("observed", "Where is the release flag configured?");
+  const followUp = await service.answer("observed", "Which tests cover it?", {
+    referencedConcept: "release flag",
+    referencedPaths: ["src/config/release-flags.ts"],
+    recentUserMessages: ["Where is the release flag configured?"],
+  });
+  assert.equal(followUp.status, "partial", "freshly selected test evidence can be weaker than the prior configuration evidence");
+  assert.match(provider.requests[1]?.messages[1]?.content ?? "", /Which tests cover release flag\?/);
+  assert.match(provider.requests[1]?.messages[0]?.content ?? "", /browser conversation hint.*untrusted data/i);
+  assert.equal(provider.requests.length, 2, "each substantive turn invokes a new provider grounding pass");
+});
+
+test("assistant page is opt-in, distinguishes Ask Project, and safely renders structured details", async () => {
+  const { store, queries, ask } = setup();
+  const services = {
+    registry: new ProjectRegistry(store, ConfigCipher.fromEnvironment()),
+    refresh: new RefreshOrchestrator(store, new AdapterRegistry()),
+    queries,
+    ask,
+    assistantUiEnabled: true,
+    agent: new ObservatoryAgentService(new ScriptedProvider([]), queries, ask, { model: "qwen2.5:7b" }),
+    tools: new ObservatoryToolService(queries, ask),
+  };
+  const server = createHttpServer(services);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const page = await fetch(`${origin}/projects/observed/assistant`);
+    assert.equal(page.status, 200);
+    const html = await page.text();
+    assert.match(html, /href="\/projects\/observed\/ask">Ask<\/a>/);
+    assert.match(html, /href="\/projects\/observed\/assistant">Assistant<\/a>/);
+    assert.match(html, /Assistant availability: <strong>Available<\/strong>/);
+    assert.match(html, /Evidence status/);
+    assert.match(html, /Answer sufficiency/);
+    assert.match(html, /resetConversation/);
+    assert.match(html, /Retrieval activity/);
+    assert.doesNotMatch(html, /innerHTML/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("disabled assistant browser route is controlled without affecting Ask Project", async () => {
+  const { store, queries, ask } = setup();
+  const services = { registry: new ProjectRegistry(store, ConfigCipher.fromEnvironment()), refresh: new RefreshOrchestrator(store, new AdapterRegistry()), queries, ask, tools: new ObservatoryToolService(queries, ask) };
+  const server = createHttpServer(services);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const assistant = await fetch(`${origin}/projects/observed/assistant`);
+    assert.equal(assistant.status, 503);
+    assert.match(await assistant.text(), /Deterministic Ask Project remains available/);
+    const askPage = await fetch(`${origin}/projects/observed/ask`);
+    assert.equal(askPage.status, 200);
+    assert.doesNotMatch(await askPage.text(), /projects\/observed\/assistant/);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }

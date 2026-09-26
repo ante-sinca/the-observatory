@@ -1,4 +1,4 @@
-# Architecture — Project Observatory v0.2A.1
+# Architecture — Project Observatory v0.2B
 
 ## Components
 
@@ -122,6 +122,29 @@ current-artifact query calls. It returns either the exact observed value/rule
 with provenance or an explicit “not established” response. Model prose cannot
 declare a value, status, or sufficiency on its own.
 
+### Conversational Assistant browser surface
+
+v0.2B adds an opt-in project-scoped browser page at
+`/projects/:projectId/assistant`. Its feature gate,
+`OBSERVATORY_ASSISTANT_UI_ENABLED=true`, is independent of provider setup: the
+Assistant navigation item is absent otherwise, and direct navigation receives a
+controlled unavailable page linking to deterministic Ask Project.
+
+The page has no server-side transcript, session memory, or persistence. It
+retains at most four recent user messages, one short referenced concept, and
+six displayed evidence paths in page memory solely to resolve a follow-up such
+as “How much is it?”. Every substantive turn calls `ObservatoryAgentService`,
+which resolves that linguistic hint and then makes a new `AskProjectService`
+grounding pass against the selected project. It does not carry forward an
+answer, evidence, status, or provider instruction. A project switch reloads
+the page and resets that local state.
+
+Responses render evidence status and answer sufficiency separately, along with
+revision, evidence, and bounded retrieval activity. The client uses DOM text
+nodes for returned/user-controlled values rather than HTML insertion. Ask
+Project remains a distinct deterministic browser/API path, and MCP retains its
+existing read-only catalogue.
+
 ### Evidence policy
 
 The agent's system policy and code enforce the following:
@@ -129,6 +152,9 @@ The agent's system policy and code enforce the following:
 - Only Observatory evidence is project evidence; a model's prior knowledge is not.
 - Retrieved files, documentation, commit text, and the question are untrusted
   data. They cannot alter system policy or tool permissions.
+- Browser conversation hints are equally untrusted linguistic context. They
+  cannot become evidence, alter the selected project, retain authority from a
+  previous turn, or change tool permissions.
 - The response status and returned evidence are copied from the deterministic
   `AskProjectService` anchor. A model cannot upgrade `partial`, `conflicted`,
   or `insufficient_evidence` to `verified_current`; weaker-status wording is

@@ -1,4 +1,4 @@
-# Project Observatory v0.1
+# Project Observatory v0.2B
 
 ## Implementation
 
@@ -53,6 +53,7 @@ $env:OBSERVATORY_AI_PROVIDER = "ollama"
 $env:OBSERVATORY_AI_MODEL = "qwen2.5:7b"
 $env:OBSERVATORY_AI_BASE_URL = "http://127.0.0.1:11434"
 $env:OBSERVATORY_AI_TIMEOUT_MS = "20000"
+$env:OBSERVATORY_ASSISTANT_UI_ENABLED = "true"
 node dist/index.js
 ```
 
@@ -68,8 +69,35 @@ Confirm that `status`, `revision`, and `evidence` identify the deterministic
 snapshot sources; model prose is interpretation only. With AI disabled (the
 default), this endpoint returns a controlled 503 while `/ask`, the browser,
 ingestion, and MCP continue normally. Do not set a localhost base URL for a
-production deployment. The current adapter has no streaming or conversational
-memory, and it intentionally provides no write or execution capability.
+production deployment. The adapter has no persisted conversational memory and
+intentionally provides no write or execution capability.
+
+#### Browser Assistant v0.2B smoke test
+
+`OBSERVATORY_ASSISTANT_UI_ENABLED=true` independently exposes the browser
+Assistant; it does not enable a provider. With the provider variables above and
+a refreshed project, open:
+
+```text
+http://localhost:3000/projects/<project>/assistant
+```
+
+Ask a short sequence such as “Where is the platform fee configured?” followed
+by “How much is it?” and inspect each answer's evidence status, answer
+sufficiency, revision, expandable evidence, and retrieval activity. The second
+turn may use the displayed concept only to resolve “it”; it is freshly grounded
+against the current project snapshot and may validly return `incomplete` if no
+current amount or rule is observed. Switch projects and confirm the transcript
+and follow-up hints reset. Entering text that asks the assistant to ignore its
+rules must not change its deterministic status, evidence, or available tools.
+
+The page keeps at most four recent user messages, one short concept, and six
+displayed evidence paths in browser memory for the open project page. It never
+stores this context server-side or treats it as evidence. Leave the UI flag
+unset in shared or production deployments unless an operator deliberately wants
+this local browser surface. When the flag is off, the navigation item is hidden
+and direct browser access returns a controlled unavailable page linking to Ask
+Project. The API remains a separately composed read-only interface.
 
 #### Optional HomeGift value-tracing smoke test
 

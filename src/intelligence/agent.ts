@@ -37,6 +37,16 @@ export interface ObservatoryAgentOptions {
   maxContextCharacters?: number;
 }
 
+/**
+ * Ephemeral, browser-provided linguistic context. It is never persisted or
+ * treated as project evidence; substantive answers still invoke AskProject.
+ */
+export interface AssistantConversationContext {
+  referencedConcept?: string;
+  referencedPaths?: string[];
+  recentUserMessages?: string[];
+}
+
 const DEFAULT_MAX_TOOL_ITERATIONS = 4;
 const DEFAULT_MAX_TOOL_CALLS = 8;
 const DEFAULT_MAX_CONTEXT_CHARACTERS = 24_000;
@@ -64,12 +74,13 @@ export class ObservatoryAgentService {
     this.maxContextCharacters = boundedOption(options.maxContextCharacters, DEFAULT_MAX_CONTEXT_CHARACTERS, 2_000, 48_000);
   }
 
-  async answer(projectRef: string, rawQuestion: string): Promise<ObservatoryAgentResponse> {
+  async answer(projectRef: string, rawQuestion: string, conversation: AssistantConversationContext = {}): Promise<ObservatoryAgentResponse> {
+    const question = resolveConversationQuestion(rawQuestion, conversation);
     // Anchor every response in the existing deterministic selection/status
     // before the model is asked to interpret anything.
-    const deterministic = await this.askProject.ask(projectRef, rawQuestion);
+    const deterministic = await this.askProject.ask(projectRef, question);
     const project = this.queries.getProject(projectRef);
-    const initialTrace = await this.traceValueEvidence(project.id, rawQuestion, deterministic);
+    const initialTrace = await this.traceValueEvidence(project.id, question, deterministic);
     const toolCalls: ObservatoryAgentToolCall[] = [...initialTrace.toolCalls];
     let responseEvidence = initialTrace.evidence;
     let assessment = initialTrace.assessment;
@@ -115,7 +126,7 @@ export class ObservatoryAgentService {
           const trace = await this.callTool(call.name, call.arguments, project.id);
           toolCalls.push(trace);
           responseEvidence = mergeEvidence(responseEvidence, evidenceFromToolTrace(trace));
-          assessment = evaluateAnswerSufficiency(rawQuestion, deterministic.status, this.evaluatedEvidence(project.id, responseEvidence));
+          assessment = evaluateAnswerSufficiency(question, deterministic.status, this.evaluatedEvidence(project.id, responseEvidence));
           if (assessment.intent === "value_lookup" && assessment.answerSufficiency === "sufficient") {
             return completedResponse(deterministic, responseEvidence, assessment, "", toolCalls);
           }
@@ -322,6 +333,18 @@ function evidenceResult(queries: ProjectQueryService, projectId: string, artifac
 
 function askResult(response: AskProjectResponse): Record<string, unknown> {
   return { project: response.project, status: response.status, repositoryRevision: response.repositoryRevision, answer: safeText(response.answer).slice(0, 4_000), evidence: response.evidence, conflicts: response.conflicts };
+}
+
+/**
+ * Conversation only disambiguates a clearly relative phrase. It never carries
+ * forward an answer, evidence, status, or provider instruction; the resulting
+ * question still starts a new AskProject grounding pass.
+ */
+function resolveConversationQuestion(rawQuestion: string, conversation: AssistantConversationContext): string {
+  const concept = typeof conversation.referencedConcept === "string" ? safeText(conversation.referencedConcept).replace(/\s+/g, " ").trim().slice(0, 160) : "";
+  if (!concept) return rawQuestion;
+  const reference = /\b(?:it|that|this\s+(?:value|setting|feature|behavio[u]?r|area|change)|the\s+(?:same|previous)\s+(?:value|setting|feature|area))\b/i;
+  return reference.test(rawQuestion) ? rawQuestion.replace(reference, concept) : rawQuestion;
 }
 
 function groundingPrompt(response: AskProjectResponse, evidence: AskProjectEvidence[], assessment: SufficiencyAssessment, maximum: number): string {
